@@ -103,15 +103,14 @@ class TestGlobalExceptionHandler:
         async def boom():
             raise RuntimeError("kaboom")
 
-        # raise_server_exceptions=False is passed to AsyncClient (not
-        # ASGITransport) so that httpx lets the ASGI app's exception handler
-        # run and return the 500 JSON response instead of re-raising the
-        # RuntimeError to the test.  The ASGITransport constructor no longer
-        # accepts this argument in httpx >= 0.28.
+        # raise_server_exceptions=False is passed to ASGITransport so that
+        # httpx lets the ASGI app's exception handler run and return the 500
+        # JSON response instead of re-raising the RuntimeError to the test.
+        # In httpx >= 0.28 this argument belongs on ASGITransport, not on
+        # AsyncClient.
         async with AsyncClient(
-            transport=ASGITransport(app=mini),
+            transport=ASGITransport(app=mini, raise_server_exceptions=False),
             base_url="http://testserver",
-            raise_server_exceptions=False,
         ) as ac:
             resp = await ac.get("/boom")
         assert resp.status_code == 500
