@@ -1071,7 +1071,7 @@ resource "kubernetes_service" "app" {
       target_port = 8000
     }
 
-    type = "ClusterIP"
+    type = "NodePort"
   }
 
   depends_on = [kubernetes_deployment.app]
