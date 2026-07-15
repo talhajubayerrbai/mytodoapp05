@@ -1,15 +1,16 @@
 import time
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import engine
+from app.database import get_db
 
 router = APIRouter()
 _start = time.time()
 
 
-@router.get("", summary="Liveness + DB connectivity check")
-async def health_check() -> dict:
+@router.get("/", summary="Liveness + DB connectivity check")
+async def health_check(db: AsyncSession = Depends(get_db)) -> dict:
     """
     Always returns HTTP 200.
     - status/database = 'ok'       → app + DB are healthy
@@ -19,8 +20,7 @@ async def health_check() -> dict:
     """
     db_ok = False
     try:
-        async with engine.connect() as conn:
-            await conn.execute(text("SELECT 1"))
+        await db.execute(text("SELECT 1"))
         db_ok = True
     except Exception:
         db_ok = False
