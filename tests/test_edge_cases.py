@@ -246,14 +246,14 @@ class TestTimestamps:
 
 class TestHealthAdditional:
     async def test_health_returns_json(self, client):
-        resp = await client.get("/health/")
+        resp = await client.get("/health")
         assert resp.headers["content-type"].startswith("application/json")
 
     async def test_health_uptime_increases(self, client):
         import asyncio
-        r1 = (await client.get("/health/")).json()
+        r1 = (await client.get("/health")).json()
         await asyncio.sleep(0.1)
-        r2 = (await client.get("/health/")).json()
+        r2 = (await client.get("/health")).json()
         assert r2["uptime"] >= r1["uptime"]
 
 

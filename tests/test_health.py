@@ -8,25 +8,25 @@ pytestmark = pytest.mark.asyncio
 
 class TestHealthEndpoint:
     async def test_health_returns_200(self, client):
-        resp = await client.get("/health/")
+        resp = await client.get("/health")
         assert resp.status_code == 200
 
     async def test_health_response_shape(self, client):
-        resp = await client.get("/health/")
+        resp = await client.get("/health")
         data = resp.json()
         assert "status" in data
         assert "database" in data
         assert "uptime" in data
 
     async def test_health_status_ok(self, client):
-        resp = await client.get("/health/")
+        resp = await client.get("/health")
         data = resp.json()
         # With a working in-memory DB, status must be "ok"
         assert data["status"] == "ok"
         assert data["database"] == "ok"
 
     async def test_health_uptime_is_numeric(self, client):
-        resp = await client.get("/health/")
+        resp = await client.get("/health")
         data = resp.json()
         assert isinstance(data["uptime"], (int, float))
         assert data["uptime"] >= 0

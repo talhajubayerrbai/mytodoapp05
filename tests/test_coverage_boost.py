@@ -1,7 +1,7 @@
 """
 Targeted tests to cover branches missed by the main suite:
 
-  - /health/  DB-error path         → health.py lines 17-21
+  - /health   DB-error path         → health.py except branch
   - /api/info DB-error path         → api.py   lines 16-20
   - Global exception handler        → main.py  line 61
   - Root / SPA fallback             → main.py  lines 71-78, 91
@@ -10,7 +10,7 @@ Targeted tests to cover branches missed by the main suite:
 """
 import pathlib
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,26 +37,21 @@ async def _create(client: AsyncClient, **kwargs) -> dict:
 
 class TestHealthDbError:
     async def test_health_degraded_when_db_fails(self, client):
-        """Force the DB execute to raise so the except branch runs."""
-        original_override = app.dependency_overrides.get(get_db)
+        """Force engine.connect() to raise so the except branch in health.py runs."""
+        import app.routers.health as health_module
 
-        async def _broken_db():
-            mock = AsyncMock(spec=AsyncSession)
-            mock.execute.side_effect = Exception("DB connection lost")
-            yield mock
+        # engine.connect() is an async context manager — mock it to raise on __aenter__
+        mock_conn_cm = MagicMock()
+        mock_conn_cm.__aenter__ = AsyncMock(side_effect=Exception("DB connection lost"))
+        mock_conn_cm.__aexit__ = AsyncMock(return_value=False)
 
-        app.dependency_overrides[get_db] = _broken_db
-        try:
-            resp = await client.get("/health/")
-            assert resp.status_code == 200
-            data = resp.json()
-            assert data["status"] == "degraded"
-            assert data["database"] == "error"
-        finally:
-            if original_override:
-                app.dependency_overrides[get_db] = original_override
-            else:
-                app.dependency_overrides.pop(get_db, None)
+        with patch.object(health_module.engine, "connect", return_value=mock_conn_cm):
+            resp = await client.get("/health")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["database"] == "error"
 
 
 # ---------------------------------------------------------------------------
