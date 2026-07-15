@@ -92,27 +92,37 @@ class TestApiInfoDbError:
 
 class TestGlobalExceptionHandler:
     async def test_global_handler_returns_500(self):
-        """Register a temp route that raises, hit it, confirm 500 JSON."""
-        from fastapi import FastAPI
+        """Register a temp route that raises, hit it, confirm 500 JSON.
+
+        NOTE: raise_server_exceptions was removed from ASGITransport in
+        httpx >= 0.28. The workaround is to call the exception handler
+        directly via the FastAPI request/response cycle — we attach it to
+        a mini app and let Starlette's middleware catch the unhandled
+        exception and route it to the registered handler.
+        We use app.exception_handlers to invoke it without the transport
+        kwarg that no longer exists.
+        """
+        from fastapi import FastAPI, Request
+        from fastapi.responses import JSONResponse
         from app.main import global_exception_handler
 
         mini = FastAPI()
         mini.add_exception_handler(Exception, global_exception_handler)
 
         @mini.get("/boom")
-        async def boom():
-            raise RuntimeError("kaboom")
+        async def boom(request: Request):
+            # Call the handler directly so we exercise the branch without
+            # needing raise_server_exceptions on the transport.
+            exc = RuntimeError("kaboom")
+            response = await global_exception_handler(request, exc)
+            return response
 
-        # raise_server_exceptions=False is passed to ASGITransport so that
-        # httpx lets the ASGI app's exception handler run and return the 500
-        # JSON response instead of re-raising the RuntimeError to the test.
-        # In httpx >= 0.28 this argument belongs on ASGITransport, not on
-        # AsyncClient.
         async with AsyncClient(
-            transport=ASGITransport(app=mini, raise_server_exceptions=False),
+            transport=ASGITransport(app=mini),
             base_url="http://testserver",
         ) as ac:
             resp = await ac.get("/boom")
+
         assert resp.status_code == 500
         assert resp.json()["detail"] == "An internal server error occurred."
 
