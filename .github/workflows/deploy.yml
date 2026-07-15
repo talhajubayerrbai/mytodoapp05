@@ -163,9 +163,11 @@ jobs:
         run: |
           terraform apply -auto-approve \
             -target=aws_ecr_repository.app \
+            -target=aws_ecr_lifecycle_policy.app \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}" \
-            -var="image_uri=placeholder"
+            -var="image_uri=placeholder" \
+            -var="db_password=placeholder"
 
       - name: Build, tag, and push Docker image
         id: build_push
@@ -224,7 +226,8 @@ jobs:
           terraform apply -auto-approve \
             -var="project_name=${PROJECT_NAME}" \
             -var="aws_region=${AWS_REGION}" \
-            -var="image_uri=${IMAGE_URI}"
+            -var="image_uri=${IMAGE_URI}" \
+            -var="db_password=${{ secrets.DB_PASSWORD }}"
 
       - name: Show outputs
         working-directory: terraform
