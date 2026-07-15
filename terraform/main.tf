@@ -874,13 +874,12 @@ resource "kubernetes_namespace" "app" {
 }
 
 # ---------------------------------------------------------------------------
-# RDS: DB Subnet Group
+# RDS — DB Subnet Group
 # ---------------------------------------------------------------------------
 
 resource "aws_db_subnet_group" "main" {
-  name        = "${var.project_name}-db-subnet-group"
-  description = "Subnet group for ${var.project_name} RDS instance (private subnets)"
-  subnet_ids  = aws_subnet.private[*].id
+  name       = "${var.project_name}-db-subnet-group"
+  subnet_ids = aws_subnet.private[*].id
 
   tags = {
     Name = "${var.project_name}-db-subnet-group"
@@ -888,38 +887,29 @@ resource "aws_db_subnet_group" "main" {
 }
 
 # ---------------------------------------------------------------------------
-# RDS: PostgreSQL Instance
+# RDS — PostgreSQL Instance
 # ---------------------------------------------------------------------------
 
 resource "aws_db_instance" "main" {
-  identifier        = "${var.project_name}-postgres"
-  engine            = "postgres"
-  engine_version    = "16.3"
-  instance_class    = var.db_instance_class
-  allocated_storage = 20
-  storage_type      = "gp2"
-  storage_encrypted = true
+  identifier             = "${var.project_name}-postgres"
+  engine                 = "postgres"
+  engine_version         = "16.3"
+  instance_class         = var.db_instance_class
+  allocated_storage      = 20
+  storage_type           = "gp2"
+  storage_encrypted      = true
 
   db_name  = var.db_name
   username = var.db_username
   password = var.db_password
 
-  lifecycle {
-    ignore_changes = [password]
-  }
-
   db_subnet_group_name   = aws_db_subnet_group.main.name
   vpc_security_group_ids = [aws_security_group.rds.id]
-
-  multi_az               = false
   publicly_accessible    = false
-  deletion_protection    = false
-  skip_final_snapshot    = true
-  apply_immediately      = true
 
   backup_retention_period = 7
-  backup_window           = "03:00-04:00"
-  maintenance_window      = "Mon:04:00-Mon:05:00"
+  deletion_protection     = false
+  skip_final_snapshot     = true
 
   tags = {
     Name = "${var.project_name}-postgres"
@@ -929,7 +919,7 @@ resource "aws_db_instance" "main" {
 }
 
 # ---------------------------------------------------------------------------
-# Kubernetes Secret: DB credentials
+# Kubernetes Secret — DB credentials
 # ---------------------------------------------------------------------------
 
 resource "kubernetes_secret" "db_credentials" {
@@ -938,15 +928,15 @@ resource "kubernetes_secret" "db_credentials" {
     namespace = kubernetes_namespace.app.metadata[0].name
   }
 
+  type = "Opaque"
+
   data = {
     DB_HOST     = aws_db_instance.main.address
-    DB_PORT     = tostring(aws_db_instance.main.port)
+    DB_PORT     = "5432"
     DB_NAME     = var.db_name
     DB_USER     = var.db_username
     DB_PASSWORD = var.db_password
   }
-
-  type = "Opaque"
 
   depends_on = [
     kubernetes_namespace.app,
@@ -959,6 +949,11 @@ resource "kubernetes_secret" "db_credentials" {
 # ---------------------------------------------------------------------------
 
 resource "kubernetes_deployment" "app" {
+  # Do NOT wait for rollout inside Terraform — the verify job confirms health.
+  # This avoids a 10-minute timeout when pods take longer to become ready
+  # (e.g. asyncpg connecting to RDS on first boot).
+  wait_for_rollout = false
+
   metadata {
     name      = var.project_name
     namespace = kubernetes_namespace.app.metadata[0].name
@@ -992,7 +987,7 @@ resource "kubernetes_deployment" "app" {
             container_port = 8000
           }
 
-          # DB credentials injected from Kubernetes Secret
+          # Inject all DB credentials from the Kubernetes secret
           env_from {
             secret_ref {
               name = kubernetes_secret.db_credentials.metadata[0].name
@@ -1001,8 +996,8 @@ resource "kubernetes_deployment" "app" {
 
           resources {
             requests = {
-              cpu    = "250m"
-              memory = "256Mi"
+              cpu    = "100m"
+              memory = "128Mi"
             }
             limits = {
               cpu    = "500m"
@@ -1010,24 +1005,37 @@ resource "kubernetes_deployment" "app" {
             }
           }
 
+          # ---------------------------------------------------------------------------
+          # Liveness probe — restart the container if the app is truly stuck.
+          # initial_delay_seconds=60: give the app time to connect to RDS + warm up
+          #   before liveness kicks in (a premature kill causes a crash loop).
+          # ---------------------------------------------------------------------------
           liveness_probe {
             http_get {
-              path = "/health/"
+              path = "/health"
               port = 8000
             }
-            initial_delay_seconds = 30
+            initial_delay_seconds = 60
             period_seconds        = 10
             failure_threshold     = 3
+            timeout_seconds       = 5
           }
 
+          # ---------------------------------------------------------------------------
+          # Readiness probe — gate traffic until the app is truly ready.
+          # initial_delay_seconds=45: asyncpg needs ~15-20s to establish the RDS
+          #   connection pool; 45s gives comfortable headroom on cold starts.
+          # failure_threshold=6: 6 × 5s = 30s grace window before marking unready.
+          # ---------------------------------------------------------------------------
           readiness_probe {
             http_get {
-              path = "/health/"
+              path = "/health"
               port = 8000
             }
-            initial_delay_seconds = 10
+            initial_delay_seconds = 45
             period_seconds        = 5
-            failure_threshold     = 3
+            failure_threshold     = 6
+            timeout_seconds       = 5
           }
         }
       }
@@ -1048,8 +1056,8 @@ resource "kubernetes_service" "app" {
   metadata {
     name      = var.project_name
     namespace = kubernetes_namespace.app.metadata[0].name
-    labels = {
-      app = var.project_name
+    annotations = {
+      "service.beta.kubernetes.io/aws-load-balancer-type" = "external"
     }
   }
 
@@ -1061,15 +1069,16 @@ resource "kubernetes_service" "app" {
     port {
       port        = 80
       target_port = 8000
-      protocol    = "TCP"
     }
 
     type = "ClusterIP"
   }
+
+  depends_on = [kubernetes_deployment.app]
 }
 
 # ---------------------------------------------------------------------------
-# Kubernetes Ingress (ALB)
+# Kubernetes Ingress
 # ---------------------------------------------------------------------------
 
 resource "kubernetes_ingress_v1" "app" {
@@ -1077,10 +1086,14 @@ resource "kubernetes_ingress_v1" "app" {
     name      = var.project_name
     namespace = kubernetes_namespace.app.metadata[0].name
     annotations = {
-      "kubernetes.io/ingress.class"               = "alb"
-      "alb.ingress.kubernetes.io/scheme"          = "internet-facing"
-      "alb.ingress.kubernetes.io/target-type"     = "ip"
-      "alb.ingress.kubernetes.io/healthcheck-path" = "/health/"
+      "kubernetes.io/ingress.class"                       = "alb"
+      "alb.ingress.kubernetes.io/scheme"                  = "internet-facing"
+      "alb.ingress.kubernetes.io/target-type"             = "ip"
+      "alb.ingress.kubernetes.io/healthcheck-path"        = "/health"
+      "alb.ingress.kubernetes.io/healthcheck-interval-seconds" = "15"
+      "alb.ingress.kubernetes.io/healthcheck-timeout-seconds"  = "5"
+      "alb.ingress.kubernetes.io/healthy-threshold-count"      = "2"
+      "alb.ingress.kubernetes.io/unhealthy-threshold-count"    = "3"
     }
   }
 
@@ -1103,39 +1116,8 @@ resource "kubernetes_ingress_v1" "app" {
     }
   }
 
-  depends_on = [helm_release.alb_controller]
-}
-
-# ---------------------------------------------------------------------------
-# Outputs
-# ---------------------------------------------------------------------------
-
-output "ecr_repository_url" {
-  description = "ECR repository URL"
-  value       = aws_ecr_repository.app.repository_url
-}
-
-output "eks_cluster_name" {
-  description = "EKS cluster name"
-  value       = aws_eks_cluster.main.name
-}
-
-output "eks_cluster_endpoint" {
-  description = "EKS cluster API endpoint"
-  value       = aws_eks_cluster.main.endpoint
-}
-
-output "rds_endpoint" {
-  description = "RDS PostgreSQL endpoint"
-  value       = aws_db_instance.main.address
-}
-
-output "rds_port" {
-  description = "RDS PostgreSQL port"
-  value       = aws_db_instance.main.port
-}
-
-output "app_url" {
-  description = "Application load balancer URL"
-  value       = "http://${kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname}"
+  depends_on = [
+    helm_release.alb_controller,
+    kubernetes_service.app,
+  ]
 }
