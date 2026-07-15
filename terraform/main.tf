@@ -41,6 +41,7 @@ variable "aws_region" {
 variable "image_uri" {
   description = "Full ECR image URI including tag"
   type        = string
+  default     = "placeholder"
 }
 
 variable "instance_type" {
@@ -986,10 +987,10 @@ output "eks_cluster_endpoint" {
 
 output "app_url" {
   description = "Application URL via ALB"
-  value       = "http://${kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname}"
+  value       = length(kubernetes_ingress_v1.app.status) > 0 && length(kubernetes_ingress_v1.app.status[0].load_balancer) > 0 && length(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress) > 0 ? "http://${kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname}" : "pending"
 }
 
 output "alb_dns_name" {
   description = "ALB DNS name"
-  value       = kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname
+  value       = length(kubernetes_ingress_v1.app.status) > 0 && length(kubernetes_ingress_v1.app.status[0].load_balancer) > 0 && length(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress) > 0 ? kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname : "pending"
 }
