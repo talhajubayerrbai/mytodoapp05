@@ -1,0 +1,45 @@
+[tool.pytest.ini_options]
+asyncio_mode                     = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths                        = ["tests"]
+python_files                     = ["test_*.py"]
+python_classes                   = ["Test*"]
+python_functions                 = ["test_*"]
+addopts                          = [
+    "--tb=short",
+    "--strict-markers",
+    "-v",
+]
+
+[tool.coverage.run]
+source   = ["app"]
+omit     = [
+    "app/__init__.py",
+    "app/schemas/__init__.py",
+    "app/models/__init__.py",
+    "app/routers/__init__.py",
+    "*/migrations/*",
+    "*/__pycache__/*",
+]
+branch   = true
+
+[tool.coverage.report]
+show_missing   = true
+skip_covered   = false
+fail_under     = 80
+exclude_lines  = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "\\.\\.\\.\\s*$",
+    "def __repr__",
+]
+
+[tool.coverage.xml]
+output = "coverage.xml"
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv", "venv"]
+skips        = ["B101"]   # assert statements are fine in tests
+# Report medium-and-above severity; pipeline fails on HIGH+HIGH

@@ -2,3 +2,23 @@ fastapi
 uvicorn[standard]
 gunicorn
 python-dotenv
+pydantic-settings
+
+# Database
+sqlalchemy[asyncio]
+aiosqlite
+
+# Testing
+pytest
+pytest-asyncio
+pytest-cov
+coverage[toml]
+httpx
+anyio[trio]
+
+# Linting
+flake8
+
+# Security scanning
+bandit[toml]
+safety
