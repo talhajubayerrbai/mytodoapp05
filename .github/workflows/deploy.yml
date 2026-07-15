@@ -272,23 +272,27 @@ jobs:
 
       - name: Get ALB DNS via kubectl
         id: get_endpoint
+        env:
+          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
         run: |
-          echo "Waiting for ingress to report a hostname (up to 5 min)..."
+          echo "Waiting for ingress to report a hostname (up to 10 min)..."
           ALB_DNS=""
-          for i in $(seq 1 30); do
-            ALB_DNS=$(kubectl get ingress app-ingress \
-              -n default \
+          INGRESS_NAME="${PROJECT_NAME}"
+          INGRESS_NS="${PROJECT_NAME}"
+          for i in $(seq 1 60); do
+            ALB_DNS=$(kubectl get ingress "${INGRESS_NAME}" \
+              -n "${INGRESS_NS}" \
               -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
             if [[ -n "${ALB_DNS}" ]]; then
               echo "✅ Got ALB DNS on attempt ${i}: ${ALB_DNS}"
               break
             fi
-            echo "Attempt ${i}/30 — ingress hostname not ready yet, waiting 10s..."
+            echo "Attempt ${i}/60 — ingress hostname not ready yet, waiting 10s..."
             sleep 10
           done
 
           if [[ -z "${ALB_DNS}" ]]; then
-            echo "❌ ALB DNS is still empty after 5 minutes — ingress controller did not provision the load balancer."
+            echo "❌ ALB DNS is still empty after 10 minutes — ingress controller did not provision the load balancer."
             echo "Falling back to AWS CLI lookup..."
             ALB_DNS=$(aws elbv2 describe-load-balancers \
               --query "LoadBalancers[?contains(LoadBalancerName, '${PROJECT_NAME}')].DNSName | [0]" \
