@@ -1095,6 +1095,7 @@ resource "kubernetes_ingress_v1" "app" {
       "alb.ingress.kubernetes.io/healthcheck-timeout-seconds"  = "5"
       "alb.ingress.kubernetes.io/healthy-threshold-count"      = "2"
       "alb.ingress.kubernetes.io/unhealthy-threshold-count"    = "3"
+      "alb.ingress.kubernetes.io/success-codes"               = "200,301,302"
     }
   }
 
