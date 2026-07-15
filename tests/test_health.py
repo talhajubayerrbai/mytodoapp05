@@ -46,7 +46,7 @@ class TestApiInfoEndpoint:
     async def test_api_info_app_name(self, client):
         resp = await client.get("/api/info")
         data = resp.json()
-        assert data["app"] == "mytodoapp05"
+        assert data["app"] == "mytodoapp05-dev"
 
     async def test_api_info_db_status(self, client):
         resp = await client.get("/api/info")

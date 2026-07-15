@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):  # type: ignore[type-arg]
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="mytodoapp05 — Todo API",
+    title="mytodoapp05-dev — Todo API",
     description=(
         "A production-grade Todo application with full CRUD, filtering, "
         "pagination, priority levels, and due-date tracking."
