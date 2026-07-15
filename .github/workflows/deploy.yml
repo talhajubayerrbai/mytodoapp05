@@ -258,52 +258,76 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: "1.7.5"
-          terraform_wrapper: false
-
-      - name: Terraform init
-        working-directory: terraform
+      - name: Install kubectl
         run: |
-          terraform init -reconfigure \
-            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
-            -backend-config="region=${{ secrets.AWS_REGION }}" \
-            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
 
-      - name: Get ALB endpoint
+      - name: Configure kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name ${{ secrets.PROJECT_NAME }}-cluster
+
+      - name: Get ALB DNS via kubectl
         id: get_endpoint
-        working-directory: terraform
         run: |
-          ALB_DNS=$(terraform output -raw alb_dns_name)
+          echo "Waiting for ingress to report a hostname (up to 5 min)..."
+          ALB_DNS=""
+          for i in $(seq 1 30); do
+            ALB_DNS=$(kubectl get ingress app-ingress \
+              -n default \
+              -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [[ -n "${ALB_DNS}" ]]; then
+              echo "✅ Got ALB DNS on attempt ${i}: ${ALB_DNS}"
+              break
+            fi
+            echo "Attempt ${i}/30 — ingress hostname not ready yet, waiting 10s..."
+            sleep 10
+          done
+
+          if [[ -z "${ALB_DNS}" ]]; then
+            echo "❌ ALB DNS is still empty after 5 minutes — ingress controller did not provision the load balancer."
+            echo "Falling back to AWS CLI lookup..."
+            ALB_DNS=$(aws elbv2 describe-load-balancers \
+              --query "LoadBalancers[?contains(LoadBalancerName, '${PROJECT_NAME}')].DNSName | [0]" \
+              --output text 2>/dev/null || true)
+            echo "AWS CLI ALB DNS: ${ALB_DNS}"
+          fi
+
+          if [[ -z "${ALB_DNS}" || "${ALB_DNS}" == "None" ]]; then
+            echo "❌ Could not determine ALB DNS from kubectl or AWS CLI. Aborting."
+            exit 1
+          fi
+
           echo "alb_dns=${ALB_DNS}" >> $GITHUB_OUTPUT
-          echo "ALB DNS: ${ALB_DNS}"
+          echo "Final ALB DNS: ${ALB_DNS}"
 
       - name: Wait for ALB DNS to resolve
         run: |
           ALB_DNS="${{ steps.get_endpoint.outputs.alb_dns }}"
-          echo "Waiting for ALB DNS to resolve: ${ALB_DNS}"
+          echo "Waiting for DNS propagation: ${ALB_DNS}"
           for i in $(seq 1 30); do
             if host "${ALB_DNS}" > /dev/null 2>&1; then
-              echo "DNS resolved after ${i} attempts"
+              echo "✅ DNS resolved after ${i} attempts"
               break
             fi
             echo "Attempt ${i}/30 — waiting 20s..."
             sleep 20
           done
 
-      - name: Smoke test — /health/ must return 2xx/3xx
+      - name: Smoke test — /health must return 2xx
         run: |
           ALB_DNS="${{ steps.get_endpoint.outputs.alb_dns }}"
           APP_URL="http://${ALB_DNS}"
-          echo "Testing: ${APP_URL}/health/"
+          echo "Testing: ${APP_URL}/health"
 
           MAX_ATTEMPTS=20
           WAIT_SECONDS=30
 
           for i in $(seq 1 ${MAX_ATTEMPTS}); do
-            STATUS=$(curl -Lsf -o /dev/null -w "%{http_code}" --max-time 15 "${APP_URL}/health/" 2>/dev/null || echo "000")
+            STATUS=$(curl -Lsf -o /dev/null -w "%{http_code}" --max-time 15 "${APP_URL}/health" 2>/dev/null || echo "000")
             echo "Attempt ${i}/${MAX_ATTEMPTS}: HTTP ${STATUS}"
 
             if [[ "${STATUS}" =~ ^[23] ]]; then
