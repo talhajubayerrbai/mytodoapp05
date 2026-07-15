@@ -103,8 +103,11 @@ class TestGlobalExceptionHandler:
         async def boom():
             raise RuntimeError("kaboom")
 
+        # raise_server_exceptions=False is required so that httpx's ASGITransport
+        # does not re-raise the exception to the test caller; instead the ASGI
+        # exception handler processes it and returns the 500 JSON response.
         async with AsyncClient(
-            transport=ASGITransport(app=mini),
+            transport=ASGITransport(app=mini, raise_server_exceptions=False),
             base_url="http://testserver",
         ) as ac:
             resp = await ac.get("/boom")
