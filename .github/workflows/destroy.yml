@@ -123,6 +123,15 @@ jobs:
             -p '{"metadata":{"finalizers":[]}}' \
             --type=merge 2>/dev/null || true
 
+          # ── 6. Force-delete the namespace via the API server to bypass stuck finalizers ──
+          echo "⏳ Force-deleting namespace '${NS}' via API server finalize endpoint ..."
+          NS_JSON=$(kubectl get namespace "${NS}" -o json 2>/dev/null || true)
+          if [[ -n "${NS_JSON}" ]]; then
+            echo "${NS_JSON}" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); d.setdefault('spec',{})['finalizers']=[]; print(json.dumps(d))" \
+              | kubectl replace --raw "/api/v1/namespaces/${NS}/finalize" -f - 2>/dev/null || true
+          fi
+
           echo "✅ Namespace '${NS}' pre-destroy drain complete."
 
       - name: Terraform destroy
