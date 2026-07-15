@@ -134,6 +134,108 @@ jobs:
 
           echo "✅ Namespace '${NS}' pre-destroy drain complete."
 
+      # ---------------------------------------------------------------------------
+      # Wait for the ALB to be fully deleted from AWS before running
+      # `terraform destroy`.
+      #
+      # Why this is needed
+      # ------------------
+      # Deleting the Ingress object (step above) only *triggers* the ALB
+      # Controller to start deprovisioning the ALB. The controller works
+      # asynchronously: it must delete the ALB listeners, target groups, and
+      # finally the load balancer itself, then release all the ENIs it created
+      # in the public subnets. This takes 30–120 seconds after the Ingress is
+      # gone from Kubernetes.
+      #
+      # If `terraform destroy` runs while those ENIs and EIPs are still live:
+      #   - aws_subnet.public fails with DependencyViolation (ENIs still in subnet)
+      #   - aws_internet_gateway.main fails with DependencyViolation
+      #     ("has some mapped public address(es)" — the ALB's EIPs)
+      #
+      # The fix: poll the AWS ELBv2 API until no ALB tagged with this cluster
+      # exists, then proceed with destroy.
+      # ---------------------------------------------------------------------------
+      - name: Pre-destroy — wait for ALB to be fully deleted from AWS
+        env:
+          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          echo "⏳ Waiting for ALB Controller to finish deleting the ALB from AWS..."
+          MAX_WAIT=300   # 5 minutes max
+          INTERVAL=10
+          ELAPSED=0
+
+          while true; do
+            # Look up any ALBs tagged by the ALB controller for this cluster.
+            # The controller tags every ALB it creates with:
+            #   elbv2.k8s.aws/cluster = <cluster-name>
+            # We also fall back to checking by name prefix (project name) in
+            # case the tag lookup returns nothing (e.g. on older controllers).
+            ALB_COUNT=$(aws elbv2 describe-load-balancers \
+              --region "${AWS_REGION}" \
+              --query "length(LoadBalancers[?contains(LoadBalancerName, '${PROJECT_NAME}')])" \
+              --output text 2>/dev/null || echo "0")
+
+            # Also check by the cluster tag used by the ALB controller
+            TAGGED_COUNT=$(aws elbv2 describe-tags \
+              --resource-arns $(aws elbv2 describe-load-balancers \
+                --region "${AWS_REGION}" \
+                --query 'LoadBalancers[*].LoadBalancerArn' \
+                --output text 2>/dev/null | tr '\t' ' ') \
+              --query "length(TagDescriptions[?Tags[?Key=='elbv2.k8s.aws/cluster' && Value=='${PROJECT_NAME}-cluster']])" \
+              --output text 2>/dev/null || echo "0")
+
+            TOTAL=$(( ${ALB_COUNT:-0} + ${TAGGED_COUNT:-0} ))
+
+            if [[ "${TOTAL}" -eq 0 ]]; then
+              echo "✅ No ALBs found for cluster '${PROJECT_NAME}-cluster' — safe to destroy VPC."
+              break
+            fi
+
+            if [[ "${ELAPSED}" -ge "${MAX_WAIT}" ]]; then
+              echo "⚠️  Timed out waiting for ALB deletion after ${MAX_WAIT}s."
+              echo "⚠️  Attempting to delete any remaining ALBs manually..."
+
+              # Last-resort: force-delete any remaining ALBs for this cluster
+              aws elbv2 describe-load-balancers \
+                --region "${AWS_REGION}" \
+                --query "LoadBalancers[?contains(LoadBalancerName, '${PROJECT_NAME}')].LoadBalancerArn" \
+                --output text 2>/dev/null | tr '\t' '\n' | while read -r ARN; do
+                  if [[ -n "${ARN}" && "${ARN}" != "None" ]]; then
+                    echo "   Force-deleting ALB: ${ARN}"
+                    aws elbv2 delete-load-balancer \
+                      --load-balancer-arn "${ARN}" \
+                      --region "${AWS_REGION}" 2>/dev/null || true
+                  fi
+              done
+
+              # Wait a bit for the force-delete to propagate
+              echo "⏳ Waiting 30s for force-delete to propagate..."
+              sleep 30
+              break
+            fi
+
+            echo "  ALBs still present (name-match: ${ALB_COUNT}, tag-match: ${TAGGED_COUNT}). Waiting ${INTERVAL}s... (${ELAPSED}/${MAX_WAIT}s elapsed)"
+            sleep ${INTERVAL}
+            ELAPSED=$(( ELAPSED + INTERVAL ))
+          done
+
+          # Also wait for any leftover target groups to be released
+          echo "⏳ Checking for orphan target groups..."
+          TGCOUNT=$(aws elbv2 describe-target-groups \
+            --region "${AWS_REGION}" \
+            --query "length(TargetGroups[?contains(TargetGroupName, '${PROJECT_NAME}')])" \
+            --output text 2>/dev/null || echo "0")
+
+          if [[ "${TGCOUNT:-0}" -gt 0 ]]; then
+            echo "⏳ Found ${TGCOUNT} target group(s) still present, waiting 20s for cleanup..."
+            sleep 20
+          else
+            echo "✅ No orphan target groups found."
+          fi
+
+          echo "✅ ALB pre-destroy wait complete."
+
       - name: Terraform destroy
         working-directory: terraform
         run: |-
