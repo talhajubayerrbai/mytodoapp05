@@ -161,13 +161,16 @@ jobs:
       - name: Ensure ECR repository exists (terraform target)
         working-directory: terraform
         run: |
+          # Strip characters forbidden by RDS: / @ " and space
+          SAFE_DB_PASSWORD=$(echo "${{ secrets.DB_PASSWORD }}" | tr -d '/@" ')
+
           terraform apply -auto-approve \
             -target=aws_ecr_repository.app \
             -target=aws_ecr_lifecycle_policy.app \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}" \
             -var="image_uri=placeholder" \
-            -var="db_password=placeholder"
+            -var="db_password=${SAFE_DB_PASSWORD}"
 
       - name: Build, tag, and push Docker image
         id: build_push
@@ -223,11 +226,14 @@ jobs:
           AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           IMAGE_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${PROJECT_NAME}:${GIT_SHA}"
 
+          # Strip characters forbidden by RDS: / @ " and space
+          SAFE_DB_PASSWORD=$(echo "${{ secrets.DB_PASSWORD }}" | tr -d '/@" ')
+
           terraform apply -auto-approve \
             -var="project_name=${PROJECT_NAME}" \
             -var="aws_region=${AWS_REGION}" \
             -var="image_uri=${IMAGE_URI}" \
-            -var="db_password=${{ secrets.DB_PASSWORD }}"
+            -var="db_password=${SAFE_DB_PASSWORD}"
 
       - name: Show outputs
         working-directory: terraform
