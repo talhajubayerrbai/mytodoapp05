@@ -33,6 +33,58 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
 
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+
+      # ---------------------------------------------------------------------------
+      # Pre-destroy: delete the Kubernetes Ingress BEFORE tearing down Terraform.
+      #
+      # Why: the AWS Load Balancer Controller places a finalizer
+      # (ingress.k8s.aws/resources) on the Ingress object and only removes it
+      # after it has fully de-provisioned the ALB. If we let `terraform destroy`
+      # attempt this deletion, it races with (or waits on) the helm_release for
+      # the ALB controller being destroyed in the same run — the controller is
+      # gone before it can clear the finalizer, so the Ingress hangs forever and
+      # Terraform times out with "Ingress still exists".
+      #
+      # The fix: while the ALB controller pods are still running, explicitly
+      # delete the Ingress via kubectl.  The controller reconciles immediately,
+      # deletes the ALB, removes the finalizer, and the Ingress disappears from
+      # Kubernetes.  `terraform destroy` then finds it already gone and succeeds.
+      # ---------------------------------------------------------------------------
+      - name: Pre-destroy — delete Kubernetes Ingress via kubectl
+        env:
+          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+        run: |
+          echo "⏳ Configuring kubeconfig for cluster ${PROJECT_NAME}-cluster ..."
+          if ! aws eks update-kubeconfig \
+                --region ${{ secrets.AWS_REGION }} \
+                --name "${PROJECT_NAME}-cluster" 2>/dev/null; then
+            echo "ℹ️  EKS cluster not found or already deleted — skipping pre-destroy step."
+            exit 0
+          fi
+
+          echo "⏳ Deleting Kubernetes Ingress '${PROJECT_NAME}' in namespace '${PROJECT_NAME}' ..."
+          # If the ingress doesn't exist, kubectl exits 1 — that's fine, continue.
+          if ! kubectl delete ingress "${PROJECT_NAME}" \
+                -n "${PROJECT_NAME}" \
+                --timeout=300s 2>/dev/null; then
+            echo "ℹ️  Ingress not found or already deleted — continuing."
+          else
+            echo "✅ Ingress deleted (ALB de-provisioned, finalizer removed)."
+          fi
+
+          # Also remove any stale finalizers in case the controller is unhealthy
+          # and could not clear them itself (belt-and-suspenders).
+          echo "⏳ Patching away any leftover finalizers on the Ingress (if it still exists) ..."
+          kubectl patch ingress "${PROJECT_NAME}" \
+            -n "${PROJECT_NAME}" \
+            -p '{"metadata":{"finalizers":[]}}' \
+            --type=merge 2>/dev/null || true
+
       - name: Terraform destroy
         working-directory: terraform
         run: |-
