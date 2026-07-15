@@ -45,7 +45,14 @@ class TestHealthDbError:
         mock_conn_cm.__aenter__ = AsyncMock(side_effect=Exception("DB connection lost"))
         mock_conn_cm.__aexit__ = AsyncMock(return_value=False)
 
-        with patch.object(health_module.engine, "connect", return_value=mock_conn_cm):
+        # AsyncEngine.connect is a read-only attribute on the instance, so we cannot
+        # use patch.object(engine_instance, "connect", ...).  Instead, replace the
+        # entire module-level `engine` with a lightweight mock whose .connect()
+        # returns our failing context manager.
+        mock_engine = MagicMock()
+        mock_engine.connect = MagicMock(return_value=mock_conn_cm)
+
+        with patch.object(health_module, "engine", mock_engine):
             resp = await client.get("/health")
 
         assert resp.status_code == 200
