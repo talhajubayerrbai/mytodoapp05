@@ -78,6 +78,11 @@ variable "db_password" {
   description = "Master password for the RDS PostgreSQL instance"
   type        = string
   sensitive   = true
+
+  validation {
+    condition     = can(regex("^[^/@\" ]+$", var.db_password))
+    error_message = "db_password must not contain '/', '@', '\"', or space characters (RDS restriction)."
+  }
 }
 
 variable "db_name" {
