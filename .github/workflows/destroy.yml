@@ -40,50 +40,90 @@ jobs:
           sudo mv kubectl /usr/local/bin/kubectl
 
       # ---------------------------------------------------------------------------
-      # Pre-destroy: delete the Kubernetes Ingress BEFORE tearing down Terraform.
+      # Pre-destroy: fully clean the application namespace BEFORE tearing down
+      # Terraform so the namespace is never stuck in "Terminating".
       #
-      # Why: the AWS Load Balancer Controller places a finalizer
-      # (ingress.k8s.aws/resources) on the Ingress object and only removes it
-      # after it has fully de-provisioned the ALB. If we let `terraform destroy`
-      # attempt this deletion, it races with (or waits on) the helm_release for
-      # the ALB controller being destroyed in the same run — the controller is
-      # gone before it can clear the finalizer, so the Ingress hangs forever and
-      # Terraform times out with "Ingress still exists".
+      # Why this is needed
+      # ------------------
+      # The AWS Load Balancer Controller places a finalizer
+      # (ingress.k8s.aws/resources) on every Ingress object it manages. It only
+      # removes that finalizer after it has fully de-provisioned the ALB. When
+      # `terraform destroy` runs, it destroys the helm_release for the ALB
+      # controller IN THE SAME PLAN as the kubernetes_namespace — so the
+      # controller pods are terminated before they can clear the Ingress
+      # finalizer. Kubernetes then refuses to complete the namespace deletion
+      # (it stays in Terminating), and Terraform times out with
+      # "context deadline exceeded" after ~5 minutes.
       #
-      # The fix: while the ALB controller pods are still running, explicitly
-      # delete the Ingress via kubectl.  The controller reconciles immediately,
-      # deletes the ALB, removes the finalizer, and the Ingress disappears from
-      # Kubernetes.  `terraform destroy` then finds it already gone and succeeds.
+      # The fix (belt-and-suspenders, three layers)
+      # -------------------------------------------
+      # 1. Delete the Ingress object gracefully first (while the ALB controller
+      #    is still running) so the controller reconciles, removes the ALB, and
+      #    strips the finalizer normally.
+      # 2. Force-patch finalizers to [] on every Ingress that still exists
+      #    (handles the race where the controller is slow or unhealthy).
+      # 3. Delete all other workloads (Deployments, Services, Secrets,
+      #    ConfigMaps) and force-patch the namespace's own finalizers to [],
+      #    so that even if a resource is stuck the namespace can be removed
+      #    immediately by Kubernetes without waiting for any controller.
       # ---------------------------------------------------------------------------
-      - name: Pre-destroy — delete Kubernetes Ingress via kubectl
+      - name: Pre-destroy — drain namespace and strip all finalizers
         env:
           PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           echo "⏳ Configuring kubeconfig for cluster ${PROJECT_NAME}-cluster ..."
           if ! aws eks update-kubeconfig \
-                --region ${{ secrets.AWS_REGION }} \
+                --region "${AWS_REGION}" \
                 --name "${PROJECT_NAME}-cluster" 2>/dev/null; then
             echo "ℹ️  EKS cluster not found or already deleted — skipping pre-destroy step."
             exit 0
           fi
 
-          echo "⏳ Deleting Kubernetes Ingress '${PROJECT_NAME}' in namespace '${PROJECT_NAME}' ..."
-          # If the ingress doesn't exist, kubectl exits 1 — that's fine, continue.
-          if ! kubectl delete ingress "${PROJECT_NAME}" \
-                -n "${PROJECT_NAME}" \
-                --timeout=300s 2>/dev/null; then
-            echo "ℹ️  Ingress not found or already deleted — continuing."
-          else
-            echo "✅ Ingress deleted (ALB de-provisioned, finalizer removed)."
-          fi
+          NS="${PROJECT_NAME}"
 
-          # Also remove any stale finalizers in case the controller is unhealthy
-          # and could not clear them itself (belt-and-suspenders).
-          echo "⏳ Patching away any leftover finalizers on the Ingress (if it still exists) ..."
-          kubectl patch ingress "${PROJECT_NAME}" \
-            -n "${PROJECT_NAME}" \
+          # ── 1. Graceful Ingress deletion (lets ALB controller clean up the ALB) ──
+          echo "⏳ Deleting Ingress objects in namespace '${NS}' gracefully ..."
+          kubectl delete ingress --all -n "${NS}" --timeout=120s 2>/dev/null || true
+
+          # ── 2. Force-strip finalizers from any Ingress that survived step 1 ──
+          echo "⏳ Force-patching finalizers off any remaining Ingress objects ..."
+          for ing in $(kubectl get ingress -n "${NS}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo "   Patching ingress/${ing} ..."
+            kubectl patch ingress "${ing}" -n "${NS}" \
+              -p '{"metadata":{"finalizers":[]}}' \
+              --type=merge 2>/dev/null || true
+          done
+
+          # ── 3. Delete all other workloads in the namespace ──
+          echo "⏳ Deleting all workloads in namespace '${NS}' ..."
+          kubectl delete deployment,service,secret,configmap \
+            --all -n "${NS}" \
+            --ignore-not-found \
+            --timeout=60s 2>/dev/null || true
+
+          # ── 4. Force-strip finalizers from any resource still stuck in the namespace ──
+          echo "⏳ Force-patching finalizers off any remaining namespace-scoped resources ..."
+          for resource_type in ingresses deployments services secrets configmaps persistentvolumeclaims; do
+            for name in $(kubectl get "${resource_type}" -n "${NS}" \
+                           -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+              echo "   Patching ${resource_type}/${name} ..."
+              kubectl patch "${resource_type}" "${name}" -n "${NS}" \
+                -p '{"metadata":{"finalizers":[]}}' \
+                --type=merge 2>/dev/null || true
+            done
+          done
+
+          # ── 5. Strip finalizers from the namespace object itself ──
+          # This is the key fix: even if something inside is still stubborn,
+          # removing the namespace's own finalizers lets Kubernetes force-delete
+          # it immediately without waiting for child resources.
+          echo "⏳ Patching namespace '${NS}' finalizers to [] ..."
+          kubectl patch namespace "${NS}" \
             -p '{"metadata":{"finalizers":[]}}' \
             --type=merge 2>/dev/null || true
+
+          echo "✅ Namespace '${NS}' pre-destroy drain complete."
 
       - name: Terraform destroy
         working-directory: terraform
