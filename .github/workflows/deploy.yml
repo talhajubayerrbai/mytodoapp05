@@ -287,7 +287,7 @@ jobs:
           PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
         run: |
           echo "⏳ Waiting for deployment rollout to complete (up to 5 min)..."
-          kubectl rollout status deployment/app \
+          kubectl rollout status deployment/"${PROJECT_NAME}" \
             -n "${PROJECT_NAME}" \
             --timeout=300s || true
 
