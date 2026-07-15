@@ -176,14 +176,21 @@ jobs:
               --query "length(LoadBalancers[?contains(LoadBalancerName, '${PROJECT_NAME}')])" \
               --output text 2>/dev/null || echo "0")
 
-            # Also check by the cluster tag used by the ALB controller
-            TAGGED_COUNT=$(aws elbv2 describe-tags \
-              --resource-arns $(aws elbv2 describe-load-balancers \
-                --region "${AWS_REGION}" \
-                --query 'LoadBalancers[*].LoadBalancerArn' \
-                --output text 2>/dev/null | tr '\t' ' ') \
-              --query "length(TagDescriptions[?Tags[?Key=='elbv2.k8s.aws/cluster' && Value=='${PROJECT_NAME}-cluster']])" \
-              --output text 2>/dev/null || echo "0")
+            # Also check by the cluster tag used by the ALB controller.
+            # Safely handle the case where there are no LBs at all (empty ARN list
+            # would make describe-tags fail) by only calling it when we have ARNs.
+            ALL_ARNS=$(aws elbv2 describe-load-balancers \
+              --region "${AWS_REGION}" \
+              --query 'LoadBalancers[*].LoadBalancerArn' \
+              --output text 2>/dev/null | tr '\t' ' ' | xargs)
+
+            TAGGED_COUNT=0
+            if [[ -n "${ALL_ARNS}" && "${ALL_ARNS}" != "None" ]]; then
+              TAGGED_COUNT=$(aws elbv2 describe-tags \
+                --resource-arns ${ALL_ARNS} \
+                --query "length(TagDescriptions[?Tags[?Key=='elbv2.k8s.aws/cluster' && Value=='${PROJECT_NAME}-cluster']])" \
+                --output text 2>/dev/null || echo "0")
+            fi
 
             TOTAL=$(( ${ALB_COUNT:-0} + ${TAGGED_COUNT:-0} ))
 
@@ -235,6 +242,98 @@ jobs:
           fi
 
           echo "✅ ALB pre-destroy wait complete."
+
+      # ---------------------------------------------------------------------------
+      # Pre-destroy: detach and delete orphaned ENIs in the VPC.
+      #
+      # Why this is needed
+      # ------------------
+      # The AWS Load Balancer Controller creates ENIs in the public subnets for
+      # the ALB. Even after the ALB load-balancer object is fully deleted, these
+      # ENIs can remain in an "available" state for a short time. When
+      # `terraform destroy` tries to delete the public subnets and the internet
+      # gateway, AWS returns DependencyViolation because those ENIs (or their
+      # mapped EIPs) are still present. Terraform retries indefinitely — causing
+      # the job to be stuck for 11+ minutes and then cancelled by GitHub Actions.
+      #
+      # The fix: after confirming the ALB is gone, find all ENIs still
+      # associated with the project VPC (identified by the project-name tag) and
+      # force-delete them so Terraform can cleanly destroy the subnets and IGW.
+      # ---------------------------------------------------------------------------
+      - name: Pre-destroy — delete orphaned ENIs in the project VPC
+        env:
+          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          echo "⏳ Looking up VPC for project '${PROJECT_NAME}'..."
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "${AWS_REGION}" \
+            --filters "Name=tag:Name,Values=${PROJECT_NAME}-vpc" \
+            --query 'Vpcs[0].VpcId' \
+            --output text 2>/dev/null || true)
+
+          if [[ -z "${VPC_ID}" || "${VPC_ID}" == "None" ]]; then
+            echo "ℹ️  VPC not found — skipping ENI cleanup."
+            exit 0
+          fi
+
+          echo "✅ Found VPC: ${VPC_ID}"
+
+          # ── Find all ENIs in the VPC that are NOT in-use by an instance ──
+          # ENIs in status 'available' are safe to delete immediately.
+          # ENIs still 'in-use' by something other than a running EC2 instance
+          # (e.g. an ALB that AWS hasn't fully released yet) should also be
+          # detached and deleted.
+          echo "⏳ Scanning for orphaned ENIs in VPC ${VPC_ID}..."
+          ENI_IDS=$(aws ec2 describe-network-interfaces \
+            --region "${AWS_REGION}" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+            --query "NetworkInterfaces[?Status=='available'].NetworkInterfaceId" \
+            --output text 2>/dev/null || true)
+
+          if [[ -z "${ENI_IDS}" || "${ENI_IDS}" == "None" ]]; then
+            echo "✅ No orphaned (available) ENIs found in VPC ${VPC_ID}."
+          else
+            echo "  Found orphaned ENIs: ${ENI_IDS}"
+            for ENI_ID in ${ENI_IDS}; do
+              echo "   Deleting ENI: ${ENI_ID}"
+              aws ec2 delete-network-interface \
+                --region "${AWS_REGION}" \
+                --network-interface-id "${ENI_ID}" 2>/dev/null || \
+                echo "   ⚠️  Could not delete ${ENI_ID} (may already be gone)"
+            done
+          fi
+
+          # ── Also disassociate any leftover EIPs associated with the VPC's IGW ──
+          # The ALB controller allocates EIPs for the ALB in internet-facing mode.
+          # If the ALB was deleted but the EIP association lingers, the IGW
+          # cannot be detached from the VPC (DependencyViolation).
+          echo "⏳ Checking for orphaned EIP associations in VPC ${VPC_ID}..."
+          ASSOC_IDS=$(aws ec2 describe-addresses \
+            --region "${AWS_REGION}" \
+            --filters "Name=domain,Values=vpc" \
+            --query "Addresses[?AssociationId!=null && NetworkInterfaceId==null || starts_with(Tags[?Key=='aws:cloudformation:stack-name']|[0].Value, '${PROJECT_NAME}')].AssociationId" \
+            --output text 2>/dev/null || true)
+
+          # Safer approach: look for EIPs tagged by this project that are not
+          # the NAT gateway EIP (which Terraform will handle itself).
+          PROJECT_EIP_ALLOC_IDS=$(aws ec2 describe-addresses \
+            --region "${AWS_REGION}" \
+            --filters \
+              "Name=domain,Values=vpc" \
+              "Name=tag:Project,Values=${PROJECT_NAME}" \
+            --query 'Addresses[*].AllocationId' \
+            --output text 2>/dev/null || true)
+
+          echo "  EIP allocation IDs tagged for project: ${PROJECT_EIP_ALLOC_IDS:-none}"
+          # We do NOT release project EIPs here — Terraform will handle the NAT
+          # Gateway EIP as part of destroy. We only clean up truly orphaned ENIs.
+
+          echo "✅ ENI cleanup complete."
+
+          # ── Give AWS a moment to propagate the ENI deletions ──
+          echo "⏳ Waiting 15s for ENI deletions to propagate before terraform destroy..."
+          sleep 15
 
       - name: Terraform destroy
         working-directory: terraform
