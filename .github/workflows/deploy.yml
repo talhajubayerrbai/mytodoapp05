@@ -216,17 +216,15 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
 
-      - name: Patch Terraform — probe delays + ALB success-codes
+      - name: Patch Terraform — probe delays
         working-directory: terraform
         run: |
           # Reduce liveness initial_delay from 60 → 30s
           sed -i 's/initial_delay_seconds = 60/initial_delay_seconds = 30/' main.tf
           # Reduce readiness initial_delay from 45 → 20s
           sed -i 's/initial_delay_seconds = 45/initial_delay_seconds = 20/' main.tf
-          # Add success-codes annotation after unhealthy-threshold-count line
-          sed -i '/alb.ingress.kubernetes.io\/unhealthy-threshold-count/a\          "alb.ingress.kubernetes.io/success-codes"             = "200"' main.tf
           echo "✅ Terraform patches applied:"
-          grep -n "initial_delay_seconds\|success-codes" main.tf
+          grep -n "initial_delay_seconds" main.tf
 
       - name: Terraform apply
         working-directory: terraform
