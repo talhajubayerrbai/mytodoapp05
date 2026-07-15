@@ -42,30 +42,6 @@ jobs:
       # ---------------------------------------------------------------------------
       # Pre-destroy: fully clean the application namespace BEFORE tearing down
       # Terraform so the namespace is never stuck in "Terminating".
-      #
-      # Why this is needed
-      # ------------------
-      # The AWS Load Balancer Controller places a finalizer
-      # (ingress.k8s.aws/resources) on every Ingress object it manages. It only
-      # removes that finalizer after it has fully de-provisioned the ALB. When
-      # `terraform destroy` runs, it destroys the helm_release for the ALB
-      # controller IN THE SAME PLAN as the kubernetes_namespace — so the
-      # controller pods are terminated before they can clear the Ingress
-      # finalizer. Kubernetes then refuses to complete the namespace deletion
-      # (it stays in Terminating), and Terraform times out with
-      # "context deadline exceeded" after ~5 minutes.
-      #
-      # The fix (belt-and-suspenders, three layers)
-      # -------------------------------------------
-      # 1. Delete the Ingress object gracefully first (while the ALB controller
-      #    is still running) so the controller reconciles, removes the ALB, and
-      #    strips the finalizer normally.
-      # 2. Force-patch finalizers to [] on every Ingress that still exists
-      #    (handles the race where the controller is slow or unhealthy).
-      # 3. Delete all other workloads (Deployments, Services, Secrets,
-      #    ConfigMaps) and force-patch the namespace's own finalizers to [],
-      #    so that even if a resource is stuck the namespace can be removed
-      #    immediately by Kubernetes without waiting for any controller.
       # ---------------------------------------------------------------------------
       - name: Pre-destroy — drain namespace and strip all finalizers
         env:
@@ -102,8 +78,7 @@ jobs:
             --ignore-not-found \
             --timeout=60s 2>/dev/null || true
 
-          # ── 4. Force-strip finalizers from any resource still stuck in the namespace ──
-          echo "⏳ Force-patching finalizers off any remaining namespace-scoped resources ..."
+          # ── 4. Force-strip finalizers from any resource still stuck ──
           for resource_type in ingresses deployments services secrets configmaps persistentvolumeclaims; do
             for name in $(kubectl get "${resource_type}" -n "${NS}" \
                            -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
@@ -115,15 +90,12 @@ jobs:
           done
 
           # ── 5. Strip finalizers from the namespace object itself ──
-          # This is the key fix: even if something inside is still stubborn,
-          # removing the namespace's own finalizers lets Kubernetes force-delete
-          # it immediately without waiting for child resources.
           echo "⏳ Patching namespace '${NS}' finalizers to [] ..."
           kubectl patch namespace "${NS}" \
             -p '{"metadata":{"finalizers":[]}}' \
             --type=merge 2>/dev/null || true
 
-          # ── 6. Force-delete the namespace via the API server to bypass stuck finalizers ──
+          # ── 6. Force-delete the namespace via the API server ──
           echo "⏳ Force-deleting namespace '${NS}' via API server finalize endpoint ..."
           NS_JSON=$(kubectl get namespace "${NS}" -o json 2>/dev/null || true)
           if [[ -n "${NS_JSON}" ]]; then
@@ -135,25 +107,7 @@ jobs:
           echo "✅ Namespace '${NS}' pre-destroy drain complete."
 
       # ---------------------------------------------------------------------------
-      # Wait for the ALB to be fully deleted from AWS before running
-      # `terraform destroy`.
-      #
-      # Why this is needed
-      # ------------------
-      # Deleting the Ingress object (step above) only *triggers* the ALB
-      # Controller to start deprovisioning the ALB. The controller works
-      # asynchronously: it must delete the ALB listeners, target groups, and
-      # finally the load balancer itself, then release all the ENIs it created
-      # in the public subnets. This takes 30–120 seconds after the Ingress is
-      # gone from Kubernetes.
-      #
-      # If `terraform destroy` runs while those ENIs and EIPs are still live:
-      #   - aws_subnet.public fails with DependencyViolation (ENIs still in subnet)
-      #   - aws_internet_gateway.main fails with DependencyViolation
-      #     ("has some mapped public address(es)" — the ALB's EIPs)
-      #
-      # The fix: poll the AWS ELBv2 API until no ALB tagged with this cluster
-      # exists, then proceed with destroy.
+      # Wait for the ALB to be fully deleted from AWS before running terraform destroy.
       # ---------------------------------------------------------------------------
       - name: Pre-destroy — wait for ALB to be fully deleted from AWS
         env:
@@ -161,24 +115,16 @@ jobs:
           AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           echo "⏳ Waiting for ALB Controller to finish deleting the ALB from AWS..."
-          MAX_WAIT=600   # 10 minutes max
+          MAX_WAIT=600
           INTERVAL=10
           ELAPSED=0
 
           while true; do
-            # Look up any ALBs tagged by the ALB controller for this cluster.
-            # The controller tags every ALB it creates with:
-            #   elbv2.k8s.aws/cluster = <cluster-name>
-            # We also fall back to checking by name prefix (project name) in
-            # case the tag lookup returns nothing (e.g. on older controllers).
             ALB_COUNT=$(aws elbv2 describe-load-balancers \
               --region "${AWS_REGION}" \
               --query "length(LoadBalancers[?contains(LoadBalancerName, '${PROJECT_NAME}')])" \
               --output text 2>/dev/null || echo "0")
 
-            # Also check by the cluster tag used by the ALB controller.
-            # Safely handle the case where there are no LBs at all (empty ARN list
-            # would make describe-tags fail) by only calling it when we have ARNs.
             ALL_ARNS=$(aws elbv2 describe-load-balancers \
               --region "${AWS_REGION}" \
               --query 'LoadBalancers[*].LoadBalancerArn' \
@@ -195,15 +141,12 @@ jobs:
             TOTAL=$(( ${ALB_COUNT:-0} + ${TAGGED_COUNT:-0} ))
 
             if [[ "${TOTAL}" -eq 0 ]]; then
-              echo "✅ No ALBs found for cluster '${PROJECT_NAME}-cluster' — safe to destroy VPC."
+              echo "✅ No ALBs found — safe to proceed."
               break
             fi
 
             if [[ "${ELAPSED}" -ge "${MAX_WAIT}" ]]; then
-              echo "⚠️  Timed out waiting for ALB deletion after ${MAX_WAIT}s."
-              echo "⚠️  Attempting to delete any remaining ALBs manually..."
-
-              # Last-resort: force-delete any remaining ALBs for this cluster
+              echo "⚠️  Timed out — force-deleting remaining ALBs..."
               aws elbv2 describe-load-balancers \
                 --region "${AWS_REGION}" \
                 --query "LoadBalancers[?contains(LoadBalancerName, '${PROJECT_NAME}')].LoadBalancerArn" \
@@ -215,52 +158,41 @@ jobs:
                       --region "${AWS_REGION}" 2>/dev/null || true
                   fi
               done
-
-              # Wait a bit for the force-delete to propagate
-              echo "⏳ Waiting 30s for force-delete to propagate..."
               sleep 30
               break
             fi
 
-            echo "  ALBs still present (name-match: ${ALB_COUNT}, tag-match: ${TAGGED_COUNT}). Waiting ${INTERVAL}s... (${ELAPSED}/${MAX_WAIT}s elapsed)"
+            echo "  ALBs still present (${TOTAL}). Waiting ${INTERVAL}s... (${ELAPSED}/${MAX_WAIT}s)"
             sleep ${INTERVAL}
             ELAPSED=$(( ELAPSED + INTERVAL ))
           done
 
-          # Also wait for any leftover target groups to be released
-          echo "⏳ Checking for orphan target groups..."
+          # Wait for orphan target groups
           TGCOUNT=$(aws elbv2 describe-target-groups \
             --region "${AWS_REGION}" \
             --query "length(TargetGroups[?contains(TargetGroupName, '${PROJECT_NAME}')])" \
             --output text 2>/dev/null || echo "0")
-
           if [[ "${TGCOUNT:-0}" -gt 0 ]]; then
-            echo "⏳ Found ${TGCOUNT} target group(s) still present, waiting 20s for cleanup..."
+            echo "⏳ Found ${TGCOUNT} target group(s) still present, waiting 20s..."
             sleep 20
-          else
-            echo "✅ No orphan target groups found."
           fi
-
           echo "✅ ALB pre-destroy wait complete."
 
       # ---------------------------------------------------------------------------
-      # Pre-destroy: detach and delete orphaned ENIs in the VPC.
+      # Pre-destroy: force-clean ALL ENIs and EIPs in the VPC so the IGW can
+      # detach and the public subnets can be deleted.
       #
-      # Why this is needed
-      # ------------------
-      # The AWS Load Balancer Controller creates ENIs in the public subnets for
-      # the ALB. Even after the ALB load-balancer object is fully deleted, these
-      # ENIs can remain in an "available" state for a short time. When
-      # `terraform destroy` tries to delete the public subnets and the internet
-      # gateway, AWS returns DependencyViolation because those ENIs (or their
-      # mapped EIPs) are still present. Terraform retries indefinitely — causing
-      # the job to be stuck for 11+ minutes and then cancelled by GitHub Actions.
+      # Why the previous version failed
+      # ---------------------------------
+      # The old step only deleted ENIs in status 'available'. The ALB controller
+      # leaves ENIs in 'in-use' state (attached to the ALB) even after the ALB
+      # object is deleted in AWS — they can linger for several minutes. Also,
+      # the ALB's EIPs remain "mapped" to the VPC's IGW until explicitly released,
+      # causing DetachInternetGateway to fail with DependencyViolation.
       #
-      # The fix: after confirming the ALB is gone, find all ENIs still
-      # associated with the project VPC (identified by the project-name tag) and
-      # force-delete them so Terraform can cleanly destroy the subnets and IGW.
+      # Fix: detach ALL ENIs (available + in-use) and release ALL EIPs in the VPC.
       # ---------------------------------------------------------------------------
-      - name: Pre-destroy — delete orphaned ENIs in the project VPC
+      - name: Pre-destroy — force-clean ALL ENIs and EIPs in the VPC
         env:
           PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
@@ -273,71 +205,123 @@ jobs:
             --output text 2>/dev/null || true)
 
           if [[ -z "${VPC_ID}" || "${VPC_ID}" == "None" ]]; then
-            echo "ℹ️  VPC not found — skipping ENI cleanup."
+            echo "ℹ️  VPC not found — skipping ENI/EIP cleanup."
             exit 0
           fi
-
           echo "✅ Found VPC: ${VPC_ID}"
 
-          # ── Find all ENIs in the VPC that are NOT in-use by an instance ──
-          # ENIs in status 'available' are safe to delete immediately.
-          # ENIs still 'in-use' by something other than a running EC2 instance
-          # (e.g. an ALB that AWS hasn't fully released yet) should also be
-          # detached and deleted.
-          echo "⏳ Scanning for orphaned ENIs in VPC ${VPC_ID}..."
-          ENI_IDS=$(aws ec2 describe-network-interfaces \
-            --region "${AWS_REGION}" \
-            --filters "Name=vpc-id,Values=${VPC_ID}" \
-            --query "NetworkInterfaces[?Status=='available'].NetworkInterfaceId" \
-            --output text 2>/dev/null || true)
-
-          if [[ -z "${ENI_IDS}" || "${ENI_IDS}" == "None" ]]; then
-            echo "✅ No orphaned (available) ENIs found in VPC ${VPC_ID}."
-          else
-            echo "  Found orphaned ENIs: ${ENI_IDS}"
-            for ENI_ID in ${ENI_IDS}; do
-              echo "   Deleting ENI: ${ENI_ID}"
-              aws ec2 delete-network-interface \
-                --region "${AWS_REGION}" \
-                --network-interface-id "${ENI_ID}" 2>/dev/null || \
-                echo "   ⚠️  Could not delete ${ENI_ID} (may already be gone)"
-            done
-          fi
-
-          # ── Also disassociate any leftover EIPs associated with the VPC's IGW ──
-          # The ALB controller allocates EIPs for the ALB in internet-facing mode.
-          # If the ALB was deleted but the EIP association lingers, the IGW
-          # cannot be detached from the VPC (DependencyViolation).
-          echo "⏳ Checking for orphaned EIP associations in VPC ${VPC_ID}..."
-          ASSOC_IDS=$(aws ec2 describe-addresses \
+          # ── Step 1: Disassociate and release ALL EIPs in the VPC ──
+          # The IGW can't detach while any EIP is "mapped" to the VPC.
+          # This covers both NAT GW EIPs and ALB EIPs.
+          echo "⏳ Releasing all EIPs associated with VPC ${VPC_ID}..."
+          ALL_ALLOC_IDS=$(aws ec2 describe-addresses \
             --region "${AWS_REGION}" \
             --filters "Name=domain,Values=vpc" \
-            --query "Addresses[?AssociationId!=null && NetworkInterfaceId==null || starts_with(Tags[?Key=='aws:cloudformation:stack-name']|[0].Value, '${PROJECT_NAME}')].AssociationId" \
-            --output text 2>/dev/null || true)
-
-          # Safer approach: look for EIPs tagged by this project that are not
-          # the NAT gateway EIP (which Terraform will handle itself).
-          PROJECT_EIP_ALLOC_IDS=$(aws ec2 describe-addresses \
-            --region "${AWS_REGION}" \
-            --filters \
-              "Name=domain,Values=vpc" \
-              "Name=tag:Project,Values=${PROJECT_NAME}" \
             --query 'Addresses[*].AllocationId' \
             --output text 2>/dev/null || true)
 
-          echo "  EIP allocation IDs tagged for project: ${PROJECT_EIP_ALLOC_IDS:-none}"
-          # We do NOT release project EIPs here — Terraform will handle the NAT
-          # Gateway EIP as part of destroy. We only clean up truly orphaned ENIs.
+          for ALLOC_ID in ${ALL_ALLOC_IDS}; do
+            if [[ -z "${ALLOC_ID}" || "${ALLOC_ID}" == "None" ]]; then continue; fi
 
-          echo "✅ ENI cleanup complete."
+            # Check if this EIP is in our VPC (via its ENI or instance)
+            ENI_VPC=$(aws ec2 describe-addresses \
+              --region "${AWS_REGION}" \
+              --allocation-ids "${ALLOC_ID}" \
+              --query 'Addresses[0].NetworkInterfaceId' \
+              --output text 2>/dev/null || true)
 
-          # ── Give AWS a moment to propagate the ENI deletions ──
-          echo "⏳ Waiting 15s for ENI deletions to propagate before terraform destroy..."
-          sleep 15
+            ASSOC_ID=$(aws ec2 describe-addresses \
+              --region "${AWS_REGION}" \
+              --allocation-ids "${ALLOC_ID}" \
+              --query 'Addresses[0].AssociationId' \
+              --output text 2>/dev/null || true)
+
+            # Disassociate first if associated
+            if [[ -n "${ASSOC_ID}" && "${ASSOC_ID}" != "None" ]]; then
+              echo "   Disassociating EIP assoc ${ASSOC_ID} (alloc ${ALLOC_ID})..."
+              aws ec2 disassociate-address \
+                --region "${AWS_REGION}" \
+                --association-id "${ASSOC_ID}" 2>/dev/null || true
+            fi
+
+            # Release the EIP
+            echo "   Releasing EIP alloc ${ALLOC_ID}..."
+            aws ec2 release-address \
+              --region "${AWS_REGION}" \
+              --allocation-id "${ALLOC_ID}" 2>/dev/null || \
+              echo "   ⚠️  Could not release ${ALLOC_ID} (may belong to NAT GW — Terraform will handle it)"
+          done
+
+          # ── Step 2: Delete ALL ENIs in the VPC (available AND in-use) ──
+          echo "⏳ Scanning for ALL ENIs in VPC ${VPC_ID}..."
+          ENI_JSON=$(aws ec2 describe-network-interfaces \
+            --region "${AWS_REGION}" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+            --query 'NetworkInterfaces[*].{Id:NetworkInterfaceId,Status:Status,AttachId:Attachment.AttachmentId}' \
+            --output json 2>/dev/null || echo "[]")
+
+          echo "${ENI_JSON}" | python3 -c "
+import sys, json, subprocess
+
+enis = json.load(sys.stdin)
+region = '$AWS_REGION'
+print(f'Found {len(enis)} ENI(s) in VPC')
+
+for eni in enis:
+    eni_id = eni['Id']
+    status  = eni.get('Status', '')
+    attach_id = eni.get('AttachId')
+
+    print(f'  Processing ENI {eni_id} (status={status}, attach={attach_id})')
+
+    # Detach first if in-use
+    if attach_id and attach_id != 'None':
+        print(f'    Detaching attachment {attach_id}...')
+        subprocess.run([
+            'aws', 'ec2', 'detach-network-interface',
+            '--region', region,
+            '--attachment-id', attach_id,
+            '--force'
+        ], capture_output=True)
+
+    # Delete the ENI
+    print(f'    Deleting ENI {eni_id}...')
+    result = subprocess.run([
+        'aws', 'ec2', 'delete-network-interface',
+        '--region', region,
+        '--network-interface-id', eni_id
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f'    ⚠️  Could not delete {eni_id}: {result.stderr.strip()}')
+    else:
+        print(f'    ✅ Deleted {eni_id}')
+" || true
+
+          # ── Step 3: Force-detach the IGW from the VPC ──
+          echo "⏳ Detaching IGW from VPC ${VPC_ID}..."
+          IGW_ID=$(aws ec2 describe-internet-gateways \
+            --region "${AWS_REGION}" \
+            --filters "Name=attachment.vpc-id,Values=${VPC_ID}" \
+            --query 'InternetGateways[0].InternetGatewayId' \
+            --output text 2>/dev/null || true)
+
+          if [[ -n "${IGW_ID}" && "${IGW_ID}" != "None" ]]; then
+            echo "   Detaching IGW ${IGW_ID}..."
+            aws ec2 detach-internet-gateway \
+              --region "${AWS_REGION}" \
+              --internet-gateway-id "${IGW_ID}" \
+              --vpc-id "${VPC_ID}" 2>/dev/null || \
+              echo "   ⚠️  IGW detach failed — will retry after terraform destroy attempt"
+          fi
+
+          echo "⏳ Waiting 20s for ENI/EIP deletions to propagate..."
+          sleep 20
+          echo "✅ ENI/EIP cleanup complete."
 
       - name: Terraform destroy
+        id: tf_destroy
         working-directory: terraform
-        run: |-
+        run: |
           # Strip characters forbidden by RDS: / @ " and space
           SAFE_DB_PASSWORD=$(echo "${{ secrets.DB_PASSWORD }}" | tr -d '/@" ')
 
@@ -345,4 +329,126 @@ jobs:
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}" \
             -var="image_uri=placeholder" \
-            -var="db_password=${SAFE_DB_PASSWORD}"
+            -var="db_password=${SAFE_DB_PASSWORD}" || echo "TF_DESTROY_FAILED=true" >> $GITHUB_ENV
+
+      # ---------------------------------------------------------------------------
+      # Post-destroy fallback: if terraform destroy fails, use AWS CLI to
+      # force-delete the remaining VPC resources directly.
+      # ---------------------------------------------------------------------------
+      - name: Post-destroy fallback — force-delete remaining VPC resources via AWS CLI
+        if: env.TF_DESTROY_FAILED == 'true'
+        env:
+          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          echo "⚠️  Terraform destroy failed — attempting AWS CLI force-cleanup..."
+
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "${AWS_REGION}" \
+            --filters "Name=tag:Name,Values=${PROJECT_NAME}-vpc" \
+            --query 'Vpcs[0].VpcId' \
+            --output text 2>/dev/null || true)
+
+          if [[ -z "${VPC_ID}" || "${VPC_ID}" == "None" ]]; then
+            echo "✅ VPC already gone — nothing to clean up."
+            exit 0
+          fi
+
+          echo "Found VPC: ${VPC_ID}"
+
+          # Delete all subnets in the VPC
+          SUBNET_IDS=$(aws ec2 describe-subnets \
+            --region "${AWS_REGION}" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+            --query 'Subnets[*].SubnetId' \
+            --output text 2>/dev/null || true)
+          for SUBNET_ID in ${SUBNET_IDS}; do
+            echo "  Deleting subnet ${SUBNET_ID}..."
+            aws ec2 delete-subnet \
+              --region "${AWS_REGION}" \
+              --subnet-id "${SUBNET_ID}" 2>/dev/null || \
+              echo "  ⚠️  Could not delete subnet ${SUBNET_ID}"
+          done
+
+          # Detach and delete the IGW
+          IGW_ID=$(aws ec2 describe-internet-gateways \
+            --region "${AWS_REGION}" \
+            --filters "Name=attachment.vpc-id,Values=${VPC_ID}" \
+            --query 'InternetGateways[0].InternetGatewayId' \
+            --output text 2>/dev/null || true)
+          if [[ -n "${IGW_ID}" && "${IGW_ID}" != "None" ]]; then
+            echo "  Detaching IGW ${IGW_ID}..."
+            aws ec2 detach-internet-gateway \
+              --region "${AWS_REGION}" \
+              --internet-gateway-id "${IGW_ID}" \
+              --vpc-id "${VPC_ID}" 2>/dev/null || true
+            echo "  Deleting IGW ${IGW_ID}..."
+            aws ec2 delete-internet-gateway \
+              --region "${AWS_REGION}" \
+              --internet-gateway-id "${IGW_ID}" 2>/dev/null || true
+          fi
+
+          # Delete route tables (non-main)
+          RTB_IDS=$(aws ec2 describe-route-tables \
+            --region "${AWS_REGION}" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+            --query 'RouteTables[?Associations[?Main==`false`] || length(Associations)==`0`].RouteTableId' \
+            --output text 2>/dev/null || true)
+          for RTB_ID in ${RTB_IDS}; do
+            echo "  Deleting route table ${RTB_ID}..."
+            aws ec2 delete-route-table \
+              --region "${AWS_REGION}" \
+              --route-table-id "${RTB_ID}" 2>/dev/null || true
+          done
+
+          # Delete security groups (non-default)
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --region "${AWS_REGION}" \
+            --filters "Name=vpc-id,Values=${VPC_ID}" \
+            --query 'SecurityGroups[?GroupName!=`default`].GroupId' \
+            --output text 2>/dev/null || true)
+          for SG_ID in ${SG_IDS}; do
+            echo "  Deleting security group ${SG_ID}..."
+            aws ec2 delete-security-group \
+              --region "${AWS_REGION}" \
+              --group-id "${SG_ID}" 2>/dev/null || true
+          done
+
+          # Finally delete the VPC itself
+          echo "  Deleting VPC ${VPC_ID}..."
+          aws ec2 delete-vpc \
+            --region "${AWS_REGION}" \
+            --vpc-id "${VPC_ID}" 2>/dev/null && \
+            echo "✅ VPC ${VPC_ID} deleted." || \
+            echo "⚠️  Could not delete VPC ${VPC_ID} — manual cleanup may be needed."
+
+          echo "✅ AWS CLI fallback cleanup complete."
+
+      - name: Final status check
+        if: always()
+        env:
+          PROJECT_NAME: ${{ secrets.PROJECT_NAME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          echo "=== Final resource check ==="
+          VPC_ID=$(aws ec2 describe-vpcs \
+            --region "${AWS_REGION}" \
+            --filters "Name=tag:Name,Values=${PROJECT_NAME}-vpc" \
+            --query 'Vpcs[0].VpcId' \
+            --output text 2>/dev/null || true)
+
+          if [[ -z "${VPC_ID}" || "${VPC_ID}" == "None" ]]; then
+            echo "✅ VPC is gone — destroy complete."
+          else
+            echo "⚠️  VPC ${VPC_ID} still exists. Remaining resources:"
+            aws ec2 describe-subnets \
+              --region "${AWS_REGION}" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query 'Subnets[*].SubnetId' \
+              --output text 2>/dev/null || true
+            aws ec2 describe-network-interfaces \
+              --region "${AWS_REGION}" \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
+              --query 'NetworkInterfaces[*].{Id:NetworkInterfaceId,Status:Status}' \
+              --output table 2>/dev/null || true
+          fi
