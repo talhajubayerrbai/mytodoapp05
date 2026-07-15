@@ -74,6 +74,30 @@ variable "max_node_count" {
   default     = 3
 }
 
+variable "db_password" {
+  description = "Master password for the RDS PostgreSQL instance"
+  type        = string
+  sensitive   = true
+}
+
+variable "db_name" {
+  description = "Database name"
+  type        = string
+  default     = "tododb"
+}
+
+variable "db_username" {
+  description = "Database master username"
+  type        = string
+  default     = "todouser"
+}
+
+variable "db_instance_class" {
+  description = "RDS instance class"
+  type        = string
+  default     = "db.t3.micro"
+}
+
 # ---------------------------------------------------------------------------
 # Provider
 # ---------------------------------------------------------------------------
@@ -394,6 +418,35 @@ resource "aws_security_group_rule" "cluster_ingress_nodes" {
   source_security_group_id = aws_security_group.eks_nodes.id
   security_group_id        = aws_security_group.eks_cluster.id
   description              = "Allow nodes to communicate with cluster API"
+}
+
+# ---------------------------------------------------------------------------
+# RDS Security Group
+# ---------------------------------------------------------------------------
+
+resource "aws_security_group" "rds" {
+  name        = "${var.project_name}-rds-sg"
+  description = "Allow PostgreSQL access from EKS worker nodes only"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    description     = "PostgreSQL from EKS nodes"
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.eks_nodes.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "${var.project_name}-rds-sg"
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -816,6 +869,83 @@ resource "kubernetes_namespace" "app" {
 }
 
 # ---------------------------------------------------------------------------
+# RDS: DB Subnet Group
+# ---------------------------------------------------------------------------
+
+resource "aws_db_subnet_group" "main" {
+  name        = "${var.project_name}-db-subnet-group"
+  description = "Subnet group for ${var.project_name} RDS instance (private subnets)"
+  subnet_ids  = aws_subnet.private[*].id
+
+  tags = {
+    Name = "${var.project_name}-db-subnet-group"
+  }
+}
+
+# ---------------------------------------------------------------------------
+# RDS: PostgreSQL Instance
+# ---------------------------------------------------------------------------
+
+resource "aws_db_instance" "main" {
+  identifier        = "${var.project_name}-postgres"
+  engine            = "postgres"
+  engine_version    = "16.3"
+  instance_class    = var.db_instance_class
+  allocated_storage = 20
+  storage_type      = "gp2"
+  storage_encrypted = true
+
+  db_name  = var.db_name
+  username = var.db_username
+  password = var.db_password
+
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+
+  multi_az               = false
+  publicly_accessible    = false
+  deletion_protection    = false
+  skip_final_snapshot    = true
+  apply_immediately      = true
+
+  backup_retention_period = 7
+  backup_window           = "03:00-04:00"
+  maintenance_window      = "Mon:04:00-Mon:05:00"
+
+  tags = {
+    Name = "${var.project_name}-postgres"
+  }
+
+  depends_on = [aws_db_subnet_group.main]
+}
+
+# ---------------------------------------------------------------------------
+# Kubernetes Secret: DB credentials
+# ---------------------------------------------------------------------------
+
+resource "kubernetes_secret" "db_credentials" {
+  metadata {
+    name      = "${var.project_name}-db-secret"
+    namespace = kubernetes_namespace.app.metadata[0].name
+  }
+
+  data = {
+    DB_HOST     = aws_db_instance.main.address
+    DB_PORT     = tostring(aws_db_instance.main.port)
+    DB_NAME     = var.db_name
+    DB_USER     = var.db_username
+    DB_PASSWORD = var.db_password
+  }
+
+  type = "Opaque"
+
+  depends_on = [
+    kubernetes_namespace.app,
+    aws_db_instance.main,
+  ]
+}
+
+# ---------------------------------------------------------------------------
 # Kubernetes Deployment
 # ---------------------------------------------------------------------------
 
@@ -851,6 +981,13 @@ resource "kubernetes_deployment" "app" {
 
           port {
             container_port = 8000
+          }
+
+          # DB credentials injected from Kubernetes Secret
+          env_from {
+            secret_ref {
+              name = kubernetes_secret.db_credentials.metadata[0].name
+            }
           }
 
           resources {
@@ -890,7 +1027,7 @@ resource "kubernetes_deployment" "app" {
 
   depends_on = [
     helm_release.alb_controller,
-    kubernetes_namespace.app,
+    kubernetes_secret.db_credentials,
   ]
 }
 
@@ -918,14 +1055,12 @@ resource "kubernetes_service" "app" {
       protocol    = "TCP"
     }
 
-    type = "NodePort"
+    type = "ClusterIP"
   }
-
-  depends_on = [kubernetes_namespace.app]
 }
 
 # ---------------------------------------------------------------------------
-# Kubernetes Ingress (creates ALB via controller)
+# Kubernetes Ingress (ALB)
 # ---------------------------------------------------------------------------
 
 resource "kubernetes_ingress_v1" "app" {
@@ -936,7 +1071,6 @@ resource "kubernetes_ingress_v1" "app" {
       "kubernetes.io/ingress.class"               = "alb"
       "alb.ingress.kubernetes.io/scheme"          = "internet-facing"
       "alb.ingress.kubernetes.io/target-type"     = "ip"
-      "alb.ingress.kubernetes.io/listen-ports"    = "[{\"HTTP\": 80}]"
       "alb.ingress.kubernetes.io/healthcheck-path" = "/health/"
     }
   }
@@ -960,10 +1094,7 @@ resource "kubernetes_ingress_v1" "app" {
     }
   }
 
-  depends_on = [
-    helm_release.alb_controller,
-    kubernetes_service.app,
-  ]
+  depends_on = [helm_release.alb_controller]
 }
 
 # ---------------------------------------------------------------------------
@@ -981,16 +1112,21 @@ output "eks_cluster_name" {
 }
 
 output "eks_cluster_endpoint" {
-  description = "EKS cluster endpoint"
+  description = "EKS cluster API endpoint"
   value       = aws_eks_cluster.main.endpoint
 }
 
-output "app_url" {
-  description = "Application URL via ALB"
-  value       = length(kubernetes_ingress_v1.app.status) > 0 && length(kubernetes_ingress_v1.app.status[0].load_balancer) > 0 && length(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress) > 0 ? "http://${kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname}" : "pending"
+output "rds_endpoint" {
+  description = "RDS PostgreSQL endpoint"
+  value       = aws_db_instance.main.address
 }
 
-output "alb_dns_name" {
-  description = "ALB DNS name"
-  value       = length(kubernetes_ingress_v1.app.status) > 0 && length(kubernetes_ingress_v1.app.status[0].load_balancer) > 0 && length(kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress) > 0 ? kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname : "pending"
+output "rds_port" {
+  description = "RDS PostgreSQL port"
+  value       = aws_db_instance.main.port
+}
+
+output "app_url" {
+  description = "Application load balancer URL"
+  value       = "http://${kubernetes_ingress_v1.app.status[0].load_balancer[0].ingress[0].hostname}"
 }

@@ -6,6 +6,7 @@ pydantic-settings
 
 # Database
 sqlalchemy[asyncio]
+asyncpg
 aiosqlite
 
 # Testing

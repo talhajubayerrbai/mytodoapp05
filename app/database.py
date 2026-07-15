@@ -8,10 +8,15 @@ class Base(DeclarativeBase):
     pass
 
 
+# Build engine kwargs — sqlite needs check_same_thread=False; asyncpg needs none
+_connect_args: dict = {}
+if "sqlite" in settings.DATABASE_URL:
+    _connect_args = {"check_same_thread": False}
+
 engine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.APP_ENV == "development",
-    connect_args={"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {},
+    connect_args=_connect_args,
 )
 
 AsyncSessionLocal = async_sessionmaker(
