@@ -39,54 +39,50 @@ jobs:
           version: 'latest'
 
       - name: Configure kubectl for EKS
+        # Best-effort — cluster may already be partially destroyed
+        continue-on-error: true
         run: |
           aws eks update-kubeconfig \
             --region ${{ secrets.AWS_REGION }} \
             --name ${{ secrets.PROJECT_NAME }}-cluster
 
-      # ── Step 1: Nuke the ALB directly via AWS CLI so we don't depend on the
-      #            ALB controller being healthy to process the Ingress deletion.
-      - name: Force-delete ALB via AWS CLI
+      # ── Step 1: Nuke ALBs + Target Groups directly via AWS CLI
+      - name: Force-delete ALB, Target Groups and ELB-owned ENIs
         run: |
           PROJECT="${{ secrets.PROJECT_NAME }}"
           REGION="${{ secrets.AWS_REGION }}"
 
-          echo "=== Finding ALBs tagged Project=${PROJECT} ==="
+          echo "=== Finding and deleting ALBs for project: ${PROJECT} ==="
           ALB_ARNS=$(aws elbv2 describe-load-balancers \
             --region "${REGION}" \
             --query "LoadBalancers[*].LoadBalancerArn" \
             --output text 2>/dev/null || true)
 
           for ARN in ${ALB_ARNS}; do
-            TAGS=$(aws elbv2 describe-tags \
-              --resource-arns "${ARN}" \
-              --region "${REGION}" \
-              --query "TagDescriptions[0].Tags" \
-              --output text 2>/dev/null || true)
             NAME=$(aws elbv2 describe-load-balancers \
               --load-balancer-arns "${ARN}" \
               --region "${REGION}" \
               --query "LoadBalancers[0].LoadBalancerName" \
               --output text 2>/dev/null || true)
-
-            if echo "${TAGS}" | grep -q "${PROJECT}" || echo "${NAME}" | grep -q "${PROJECT}"; then
+            TAGS=$(aws elbv2 describe-tags \
+              --resource-arns "${ARN}" \
+              --region "${REGION}" \
+              --query "TagDescriptions[0].Tags" \
+              --output text 2>/dev/null || true)
+            if echo "${TAGS}${NAME}" | grep -q "${PROJECT}"; then
               echo "Deleting ALB: ${NAME} (${ARN})"
               aws elbv2 delete-load-balancer \
                 --load-balancer-arn "${ARN}" \
                 --region "${REGION}" || true
-
-              echo "Waiting for ALB ${NAME} to be deleted..."
+              # Poll until gone (max 4 min)
               for i in $(seq 1 24); do
                 STATE=$(aws elbv2 describe-load-balancers \
                   --load-balancer-arns "${ARN}" \
                   --region "${REGION}" \
                   --query "LoadBalancers[0].State.Code" \
                   --output text 2>/dev/null || echo "deleted")
-                echo "  Attempt ${i}/24: state=${STATE}"
-                if [ "${STATE}" = "deleted" ] || [ "${STATE}" = "None" ] || [ -z "${STATE}" ]; then
-                  echo "  ALB deleted."
-                  break
-                fi
+                echo "  [${i}/24] ALB state: ${STATE}"
+                [ "${STATE}" = "deleted" ] || [ "${STATE}" = "None" ] || [ -z "${STATE}" ] && break
                 sleep 10
               done
             else
@@ -94,7 +90,7 @@ jobs:
             fi
           done
 
-          echo "=== Deleting any leftover Target Groups for ${PROJECT} ==="
+          echo "=== Deleting leftover Target Groups for ${PROJECT} ==="
           TG_ARNS=$(aws elbv2 describe-target-groups \
             --region "${REGION}" \
             --query "TargetGroups[*].TargetGroupArn" \
@@ -113,7 +109,7 @@ jobs:
             fi
           done
 
-          echo "=== Force-releasing ELB ENIs in VPC ==="
+          echo "=== Releasing ELB-owned ENIs in project VPC ==="
           VPC_ID=$(aws ec2 describe-vpcs \
             --filters "Name=tag:Project,Values=${PROJECT}" \
             --region "${REGION}" \
@@ -121,104 +117,199 @@ jobs:
             --output text 2>/dev/null || true)
 
           if [ -n "${VPC_ID}" ] && [ "${VPC_ID}" != "None" ]; then
-            ENI_IDS=$(aws ec2 describe-network-interfaces \
+            ELB_ENI_IDS=$(aws ec2 describe-network-interfaces \
               --filters "Name=vpc-id,Values=${VPC_ID}" \
               --region "${REGION}" \
               --query "NetworkInterfaces[?contains(Description,'ELB')].NetworkInterfaceId" \
               --output text 2>/dev/null || true)
-            for ENI_ID in ${ENI_IDS}; do
+            for ENI_ID in ${ELB_ENI_IDS}; do
               STATUS=$(aws ec2 describe-network-interfaces \
                 --network-interface-ids "${ENI_ID}" \
                 --region "${REGION}" \
                 --query "NetworkInterfaces[0].Status" \
                 --output text 2>/dev/null || echo "gone")
               if [ "${STATUS}" = "in-use" ]; then
-                ATTACHMENT_ID=$(aws ec2 describe-network-interfaces \
+                ATT_ID=$(aws ec2 describe-network-interfaces \
                   --network-interface-ids "${ENI_ID}" \
                   --region "${REGION}" \
                   --query "NetworkInterfaces[0].Attachment.AttachmentId" \
                   --output text 2>/dev/null || true)
-                if [ -n "${ATTACHMENT_ID}" ] && [ "${ATTACHMENT_ID}" != "None" ]; then
-                  echo "Detaching ENI ${ENI_ID} (attachment ${ATTACHMENT_ID})"
+                if [ -n "${ATT_ID}" ] && [ "${ATT_ID}" != "None" ]; then
+                  echo "Detaching ELB ENI ${ENI_ID}"
                   aws ec2 detach-network-interface \
-                    --attachment-id "${ATTACHMENT_ID}" \
-                    --force \
+                    --attachment-id "${ATT_ID}" --force \
                     --region "${REGION}" || true
                   sleep 5
                 fi
               fi
-              if [ "${STATUS}" != "gone" ]; then
-                echo "Deleting ENI ${ENI_ID}"
-                aws ec2 delete-network-interface \
-                  --network-interface-id "${ENI_ID}" \
-                  --region "${REGION}" || true
-              fi
+              echo "Deleting ELB ENI ${ENI_ID}"
+              aws ec2 delete-network-interface \
+                --network-interface-id "${ENI_ID}" \
+                --region "${REGION}" || true
             done
           fi
-          echo "=== ALB/ENI pre-cleanup complete ==="
+          echo "=== ALB pre-cleanup done ==="
 
-      # ── Step 2: Delete all K8s LoadBalancer Services to prevent new ELBs spawning
-      - name: Delete all K8s LoadBalancer Services
+      # ── Step 2: Delete K8s LoadBalancer Services and Ingress objects
+      - name: Delete K8s LoadBalancer Services and Ingress
+        continue-on-error: true
         run: |
-          echo "=== Deleting all LoadBalancer-type Services across all namespaces ==="
+          echo "=== Deleting LoadBalancer Services ==="
           kubectl get svc -A --no-headers 2>/dev/null \
             | awk '$4 == "LoadBalancer" {print $1 " " $2}' \
             | while read NS SVC; do
-                echo "Deleting Service ${NS}/${SVC}"
+                echo "Deleting svc ${NS}/${SVC}"
                 kubectl delete svc "${SVC}" -n "${NS}" --ignore-not-found=true || true
               done
-          echo "Waiting 20s for service deletion to propagate..."
-          sleep 20
 
-      # ── Step 3: Delete Kubernetes Ingress objects (belt-and-suspenders)
-      - name: Pre-delete Ingress and wait for ALB to be removed
-        run: |
-          NAMESPACE=$(kubectl get ingress -A --no-headers 2>/dev/null \
-            | awk '{print $1}' | head -1)
-          NAMESPACE=${NAMESPACE:-default}
-
-          echo "Deleting Kubernetes Ingress in namespace: ${NAMESPACE}"
-          kubectl delete ingress --all -n "${NAMESPACE}" --ignore-not-found=true
-
-          echo "Waiting up to 2 minutes for Ingress resources to clear..."
-          for i in $(seq 1 12); do
-            COUNT=$(kubectl get ingress -A --no-headers 2>/dev/null | wc -l)
-            if [ "${COUNT}" -eq 0 ]; then
-              echo "All Ingress resources gone (${i} checks). Proceeding."
-              break
-            fi
-            echo "Attempt ${i}/12 — ${COUNT} Ingress resource(s) still present, waiting 10s..."
-            sleep 10
-          done
-
-          # Forcefully remove finalizers if any Ingress is still stuck
+          echo "=== Deleting Ingress objects and removing finalizers ==="
           STUCK=$(kubectl get ingress -A --no-headers 2>/dev/null | awk '{print $1"/"$2}')
           if [ -n "${STUCK}" ]; then
-            echo "WARNING: Ingress still stuck after wait. Removing finalizers forcefully."
             while IFS='/' read -r NS NAME; do
-              echo "Force-removing finalizers from Ingress ${NS}/${NAME}"
+              echo "Patching finalizers on ${NS}/${NAME}"
               kubectl patch ingress "${NAME}" -n "${NS}" \
                 --type=json \
                 -p='[{"op":"replace","path":"/metadata/finalizers","value":[]}]' \
                 || true
-              kubectl delete ingress "${NAME}" -n "${NS}" --force --grace-period=0 || true
+              kubectl delete ingress "${NAME}" -n "${NS}" \
+                --force --grace-period=0 || true
             done <<< "${STUCK}"
-            sleep 5
+          fi
+          sleep 10
+          echo "=== K8s cleanup done ==="
+
+      # ── Step 3: Delete EKS node group via AWS CLI and wait until DELETED
+      #            This frees the node ENIs that block subnet/SG deletion.
+      - name: Delete EKS node group and wait
+        run: |
+          PROJECT="${{ secrets.PROJECT_NAME }}"
+          REGION="${{ secrets.AWS_REGION }}"
+          CLUSTER="${PROJECT}-cluster"
+          NODE_GROUP="${PROJECT}-node-group"
+
+          STATUS=$(aws eks describe-nodegroup \
+            --cluster-name "${CLUSTER}" \
+            --nodegroup-name "${NODE_GROUP}" \
+            --region "${REGION}" \
+            --query "nodegroup.status" \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "${STATUS}" = "NOT_FOUND" ] || [ "${STATUS}" = "None" ] || [ -z "${STATUS}" ]; then
+            echo "Node group ${NODE_GROUP} not found — skipping."
+          else
+            echo "Node group status: ${STATUS}. Requesting deletion..."
+            aws eks delete-nodegroup \
+              --cluster-name "${CLUSTER}" \
+              --nodegroup-name "${NODE_GROUP}" \
+              --region "${REGION}" || true
+
+            echo "Waiting for node group to be fully deleted (max 20 min)..."
+            for i in $(seq 1 120); do
+              CUR=$(aws eks describe-nodegroup \
+                --cluster-name "${CLUSTER}" \
+                --nodegroup-name "${NODE_GROUP}" \
+                --region "${REGION}" \
+                --query "nodegroup.status" \
+                --output text 2>/dev/null || echo "DELETED")
+              echo "  [${i}/120] Node group status: ${CUR}"
+              if [ "${CUR}" = "DELETED" ] || [ -z "${CUR}" ]; then
+                echo "Node group deleted."
+                break
+              fi
+              sleep 10
+            done
           fi
 
-      # ── Step 4: Terraform destroy
+      # ── Step 4: Delete EKS cluster via AWS CLI and wait until gone
+      - name: Delete EKS cluster and wait
+        run: |
+          PROJECT="${{ secrets.PROJECT_NAME }}"
+          REGION="${{ secrets.AWS_REGION }}"
+          CLUSTER="${PROJECT}-cluster"
+
+          STATUS=$(aws eks describe-cluster \
+            --name "${CLUSTER}" \
+            --region "${REGION}" \
+            --query "cluster.status" \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "${STATUS}" = "NOT_FOUND" ] || [ "${STATUS}" = "None" ] || [ -z "${STATUS}" ]; then
+            echo "EKS cluster ${CLUSTER} not found — skipping."
+          else
+            echo "EKS cluster status: ${STATUS}. Requesting deletion..."
+            aws eks delete-cluster \
+              --name "${CLUSTER}" \
+              --region "${REGION}" || true
+
+            echo "Waiting for EKS cluster to be fully deleted (max 20 min)..."
+            for i in $(seq 1 120); do
+              CUR=$(aws eks describe-cluster \
+                --name "${CLUSTER}" \
+                --region "${REGION}" \
+                --query "cluster.status" \
+                --output text 2>/dev/null || echo "DELETED")
+              echo "  [${i}/120] Cluster status: ${CUR}"
+              if [ "${CUR}" = "DELETED" ] || [ -z "${CUR}" ]; then
+                echo "EKS cluster deleted."
+                break
+              fi
+              sleep 10
+            done
+          fi
+
+      # ── Step 5: Delete RDS instance (no final snapshot) and wait
+      - name: Delete RDS instance and wait
+        run: |
+          PROJECT="${{ secrets.PROJECT_NAME }}"
+          REGION="${{ secrets.AWS_REGION }}"
+          DB_ID="${PROJECT}-postgres"
+
+          STATUS=$(aws rds describe-db-instances \
+            --db-instance-identifier "${DB_ID}" \
+            --region "${REGION}" \
+            --query "DBInstances[0].DBInstanceStatus" \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          if [ "${STATUS}" = "NOT_FOUND" ] || [ "${STATUS}" = "None" ] || [ -z "${STATUS}" ]; then
+            echo "RDS instance ${DB_ID} not found — skipping."
+          else
+            echo "RDS status: ${STATUS}. Requesting deletion..."
+            aws rds delete-db-instance \
+              --db-instance-identifier "${DB_ID}" \
+              --skip-final-snapshot \
+              --delete-automated-backups \
+              --region "${REGION}" || true
+
+            echo "Waiting for RDS to be fully deleted (max 20 min)..."
+            for i in $(seq 1 120); do
+              CUR=$(aws rds describe-db-instances \
+                --db-instance-identifier "${DB_ID}" \
+                --region "${REGION}" \
+                --query "DBInstances[0].DBInstanceStatus" \
+                --output text 2>/dev/null || echo "DELETED")
+              echo "  [${i}/120] RDS status: ${CUR}"
+              if [ "${CUR}" = "DELETED" ] || [ -z "${CUR}" ]; then
+                echo "RDS instance deleted."
+                break
+              fi
+              sleep 10
+            done
+          fi
+
+      # ── Step 6: Terraform destroy — IAM, ECR, VPC networking, OIDC, etc.
       - name: Terraform destroy
         working-directory: terraform
-        run: |-
+        run: |
           SAFE_DB_PASSWORD=$(echo "${{ secrets.DB_PASSWORD }}" | tr -d '/@" ')
 
-          terraform destroy -auto-approve \
+          terraform destroy -auto-approve -refresh=false \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}" \
             -var="image_uri=placeholder" \
-            -var="db_password=${SAFE_DB_PASSWORD}"
+            -var="db_password=${SAFE_DB_PASSWORD}" \
+            || true
 
-      # ── Step 5: AWS CLI fallback — mop up anything Terraform left behind
+      # ── Step 7: AWS CLI fallback — mop up anything still remaining
       - name: Post-destroy AWS CLI fallback cleanup
         if: always()
         run: |
@@ -234,20 +325,22 @@ jobs:
             --output text 2>/dev/null || true)
 
           if [ -z "${VPC_ID}" ] || [ "${VPC_ID}" = "None" ]; then
-            echo "No VPC found for project ${PROJECT} — nothing to clean up."
+            echo "No VPC found — nothing to clean up."
             exit 0
           fi
           echo "VPC to clean: ${VPC_ID}"
 
           # 1. Delete NAT Gateways
           NAT_IDS=$(aws ec2 describe-nat-gateways \
-            --filter "Name=vpc-id,Values=${VPC_ID}" "Name=state,Values=available,pending,deleting" \
+            --filter "Name=vpc-id,Values=${VPC_ID}" \
+                     "Name=state,Values=available,pending,deleting" \
             --region "${REGION}" \
             --query "NatGateways[*].NatGatewayId" \
             --output text 2>/dev/null || true)
           for NAT_ID in ${NAT_IDS}; do
             echo "Deleting NAT Gateway ${NAT_ID}"
-            aws ec2 delete-nat-gateway --nat-gateway-id "${NAT_ID}" --region "${REGION}" || true
+            aws ec2 delete-nat-gateway \
+              --nat-gateway-id "${NAT_ID}" --region "${REGION}" || true
           done
           if [ -n "${NAT_IDS}" ]; then
             echo "Waiting 60s for NAT Gateways to finish deleting..."
@@ -262,40 +355,56 @@ jobs:
             --output text 2>/dev/null || true)
           for ALLOC in ${EIP_ALLOCS}; do
             echo "Releasing EIP ${ALLOC}"
-            aws ec2 release-address --allocation-id "${ALLOC}" --region "${REGION}" || true
+            aws ec2 release-address \
+              --allocation-id "${ALLOC}" --region "${REGION}" || true
           done
 
-          # 3. Delete remaining ENIs
-          ENI_IDS=$(aws ec2 describe-network-interfaces \
-            --filters "Name=vpc-id,Values=${VPC_ID}" \
-            --region "${REGION}" \
-            --query "NetworkInterfaces[*].NetworkInterfaceId" \
-            --output text 2>/dev/null || true)
-          for ENI_ID in ${ENI_IDS}; do
-            STATUS=$(aws ec2 describe-network-interfaces \
-              --network-interface-ids "${ENI_ID}" \
+          # 3. Delete ALL ENIs in the VPC — retry up to 3 times with waits
+          #    (node ENIs may still be detaching after EKS cluster deletion)
+          for ATTEMPT in 1 2 3; do
+            echo "--- ENI cleanup attempt ${ATTEMPT}/3 ---"
+            ENI_IDS=$(aws ec2 describe-network-interfaces \
+              --filters "Name=vpc-id,Values=${VPC_ID}" \
               --region "${REGION}" \
-              --query "NetworkInterfaces[0].Status" \
-              --output text 2>/dev/null || echo "gone")
-            if [ "${STATUS}" = "in-use" ]; then
-              ATTACHMENT_ID=$(aws ec2 describe-network-interfaces \
+              --query "NetworkInterfaces[*].NetworkInterfaceId" \
+              --output text 2>/dev/null || true)
+
+            REMAINING=0
+            for ENI_ID in ${ENI_IDS}; do
+              STATUS=$(aws ec2 describe-network-interfaces \
                 --network-interface-ids "${ENI_ID}" \
                 --region "${REGION}" \
-                --query "NetworkInterfaces[0].Attachment.AttachmentId" \
-                --output text 2>/dev/null || true)
-              if [ -n "${ATTACHMENT_ID}" ] && [ "${ATTACHMENT_ID}" != "None" ]; then
-                echo "Detaching ENI ${ENI_ID}"
-                aws ec2 detach-network-interface \
-                  --attachment-id "${ATTACHMENT_ID}" \
-                  --force \
-                  --region "${REGION}" || true
-                sleep 5
+                --query "NetworkInterfaces[0].Status" \
+                --output text 2>/dev/null || echo "gone")
+              if [ "${STATUS}" = "gone" ] || [ -z "${STATUS}" ]; then
+                continue
               fi
+              if [ "${STATUS}" = "in-use" ]; then
+                ATT_ID=$(aws ec2 describe-network-interfaces \
+                  --network-interface-ids "${ENI_ID}" \
+                  --region "${REGION}" \
+                  --query "NetworkInterfaces[0].Attachment.AttachmentId" \
+                  --output text 2>/dev/null || true)
+                if [ -n "${ATT_ID}" ] && [ "${ATT_ID}" != "None" ]; then
+                  echo "Force-detaching ENI ${ENI_ID} (${ATT_ID})"
+                  aws ec2 detach-network-interface \
+                    --attachment-id "${ATT_ID}" --force \
+                    --region "${REGION}" || true
+                  sleep 8
+                fi
+              fi
+              echo "Deleting ENI ${ENI_ID}"
+              aws ec2 delete-network-interface \
+                --network-interface-id "${ENI_ID}" \
+                --region "${REGION}" || REMAINING=$((REMAINING+1))
+            done
+
+            if [ "${REMAINING}" -eq 0 ]; then
+              echo "All ENIs deleted."
+              break
             fi
-            echo "Deleting ENI ${ENI_ID}"
-            aws ec2 delete-network-interface \
-              --network-interface-id "${ENI_ID}" \
-              --region "${REGION}" || true
+            echo "${REMAINING} ENI(s) still remaining; waiting 30s before retry..."
+            sleep 30
           done
 
           # 4. Detach and delete Internet Gateway
@@ -305,11 +414,10 @@ jobs:
             --query "InternetGateways[*].InternetGatewayId" \
             --output text 2>/dev/null || true)
           for IGW_ID in ${IGW_IDS}; do
-            echo "Detaching IGW ${IGW_ID} from VPC ${VPC_ID}"
+            echo "Detaching IGW ${IGW_ID}"
             aws ec2 detach-internet-gateway \
               --internet-gateway-id "${IGW_ID}" \
-              --vpc-id "${VPC_ID}" \
-              --region "${REGION}" || true
+              --vpc-id "${VPC_ID}" --region "${REGION}" || true
             echo "Deleting IGW ${IGW_ID}"
             aws ec2 delete-internet-gateway \
               --internet-gateway-id "${IGW_ID}" \
@@ -325,8 +433,7 @@ jobs:
           for SUBNET_ID in ${SUBNET_IDS}; do
             echo "Deleting subnet ${SUBNET_ID}"
             aws ec2 delete-subnet \
-              --subnet-id "${SUBNET_ID}" \
-              --region "${REGION}" || true
+              --subnet-id "${SUBNET_ID}" --region "${REGION}" || true
           done
 
           # 6. Delete non-main route tables
@@ -338,27 +445,76 @@ jobs:
           for RT_ID in ${RT_IDS}; do
             echo "Deleting route table ${RT_ID}"
             aws ec2 delete-route-table \
-              --route-table-id "${RT_ID}" \
-              --region "${REGION}" || true
+              --route-table-id "${RT_ID}" --region "${REGION}" || true
           done
 
-          # 7. Delete non-default security groups
+          # 7. Delete non-default security groups — with retry (SG rules
+          #    may still reference each other; delete rules first then SGs)
+          echo "=== Revoking cross-SG rules before deleting SGs ==="
           SG_IDS=$(aws ec2 describe-security-groups \
             --filters "Name=vpc-id,Values=${VPC_ID}" \
             --region "${REGION}" \
             --query "SecurityGroups[?GroupName != 'default'].GroupId" \
             --output text 2>/dev/null || true)
+
+          # Revoke all ingress/egress rules referencing other SGs in this VPC
           for SG_ID in ${SG_IDS}; do
-            echo "Deleting security group ${SG_ID}"
-            aws ec2 delete-security-group \
-              --group-id "${SG_ID}" \
-              --region "${REGION}" || true
+            # Revoke all ingress
+            INGRESS=$(aws ec2 describe-security-groups \
+              --group-ids "${SG_ID}" --region "${REGION}" \
+              --query "SecurityGroups[0].IpPermissions" \
+              --output json 2>/dev/null || echo "[]")
+            if [ "${INGRESS}" != "[]" ] && [ "${INGRESS}" != "" ]; then
+              aws ec2 revoke-security-group-ingress \
+                --group-id "${SG_ID}" \
+                --ip-permissions "${INGRESS}" \
+                --region "${REGION}" 2>/dev/null || true
+            fi
+            # Revoke all egress
+            EGRESS=$(aws ec2 describe-security-groups \
+              --group-ids "${SG_ID}" --region "${REGION}" \
+              --query "SecurityGroups[0].IpPermissionsEgress" \
+              --output json 2>/dev/null || echo "[]")
+            if [ "${EGRESS}" != "[]" ] && [ "${EGRESS}" != "" ]; then
+              aws ec2 revoke-security-group-egress \
+                --group-id "${SG_ID}" \
+                --ip-permissions "${EGRESS}" \
+                --region "${REGION}" 2>/dev/null || true
+            fi
           done
 
-          # 8. Delete VPC
+          echo "=== Deleting security groups (with retry) ==="
+          for ATTEMPT in 1 2 3; do
+            echo "--- SG deletion attempt ${ATTEMPT}/3 ---"
+            REMAINING_SGS=0
+            for SG_ID in ${SG_IDS}; do
+              EXISTS=$(aws ec2 describe-security-groups \
+                --group-ids "${SG_ID}" --region "${REGION}" \
+                --query "SecurityGroups[0].GroupId" \
+                --output text 2>/dev/null || echo "NOT_FOUND")
+              [ "${EXISTS}" = "NOT_FOUND" ] && continue
+              echo "Deleting security group ${SG_ID}"
+              aws ec2 delete-security-group \
+                --group-id "${SG_ID}" --region "${REGION}" \
+                || REMAINING_SGS=$((REMAINING_SGS+1))
+            done
+            if [ "${REMAINING_SGS}" -eq 0 ]; then
+              echo "All security groups deleted."
+              break
+            fi
+            echo "${REMAINING_SGS} SG(s) still remaining; waiting 20s..."
+            sleep 20
+          done
+
+          # 8. Delete RDS subnet group if still present
+          echo "=== Deleting RDS subnet group ==="
+          aws rds delete-db-subnet-group \
+            --db-subnet-group-name "${PROJECT}-db-subnet-group" \
+            --region "${REGION}" 2>/dev/null || true
+
+          # 9. Delete VPC
           echo "Deleting VPC ${VPC_ID}"
           aws ec2 delete-vpc \
-            --vpc-id "${VPC_ID}" \
-            --region "${REGION}" || true
+            --vpc-id "${VPC_ID}" --region "${REGION}" || true
 
           echo "=== Post-destroy fallback cleanup complete ==="
