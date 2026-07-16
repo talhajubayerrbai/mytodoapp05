@@ -36,7 +36,11 @@ jobs:
       - name: Terraform destroy
         working-directory: terraform
         run: |-
+          # Strip characters forbidden by RDS: / @ " and space
+          SAFE_DB_PASSWORD=$(echo "${{ secrets.DB_PASSWORD }}" | tr -d '/@" ')
+
           terraform destroy -auto-approve \
             -var="project_name=${{ secrets.PROJECT_NAME }}" \
             -var="aws_region=${{ secrets.AWS_REGION }}" \
-            -var="image_uri=placeholder"
+            -var="image_uri=placeholder" \
+            -var="db_password=${SAFE_DB_PASSWORD}"
