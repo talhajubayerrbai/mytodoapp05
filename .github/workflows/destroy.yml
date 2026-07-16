@@ -33,6 +33,53 @@ jobs:
             -backend-config="region=${{ secrets.AWS_REGION }}" \
             -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
 
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name ${{ secrets.PROJECT_NAME }}-cluster
+
+      - name: Pre-delete Ingress and wait for ALB to be removed
+        run: |
+          NAMESPACE=$(kubectl get ingress -A --no-headers 2>/dev/null \
+            | awk '{print $1}' | head -1)
+          NAMESPACE=${NAMESPACE:-default}
+
+          echo "Deleting Kubernetes Ingress in namespace: ${NAMESPACE}"
+          # Delete the ingress — the ALB controller (still running) will delete the ALB
+          kubectl delete ingress --all -n "${NAMESPACE}" --ignore-not-found=true
+
+          echo "Waiting up to 5 minutes for Ingress/ALB to be fully removed..."
+          for i in $(seq 1 30); do
+            COUNT=$(kubectl get ingress -A --no-headers 2>/dev/null | wc -l)
+            if [ "${COUNT}" -eq 0 ]; then
+              echo "All Ingress resources deleted (${i} checks). Proceeding."
+              break
+            fi
+            echo "Attempt ${i}/30 — ${COUNT} Ingress resource(s) still present, waiting 10s..."
+            sleep 10
+          done
+
+          # Forcefully remove finalizers if any Ingress is still stuck
+          STUCK=$(kubectl get ingress -A --no-headers 2>/dev/null | awk '{print $1"/"$2}')
+          if [ -n "${STUCK}" ]; then
+            echo "WARNING: Ingress still stuck after wait. Removing finalizers forcefully."
+            while IFS='/' read -r NS NAME; do
+              echo "Force-removing finalizers from Ingress ${NS}/${NAME}"
+              kubectl patch ingress "${NAME}" -n "${NS}" \
+                --type=json \
+                -p='[{"op":"replace","path":"/metadata/finalizers","value":[]}]' \
+                || true
+              kubectl delete ingress "${NAME}" -n "${NS}" --force --grace-period=0 || true
+            done <<< "${STUCK}"
+            sleep 5
+          fi
+
       - name: Terraform destroy
         working-directory: terraform
         run: |-
