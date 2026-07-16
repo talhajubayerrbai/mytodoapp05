@@ -1012,7 +1012,7 @@ resource "kubernetes_deployment" "app" {
           # ---------------------------------------------------------------------------
           liveness_probe {
             http_get {
-              path = "/health"
+              path = "/health/"
               port = 8000
             }
             initial_delay_seconds = 60
