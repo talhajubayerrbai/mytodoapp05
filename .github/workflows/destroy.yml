@@ -62,13 +62,36 @@ jobs:
               break
             fi
             echo "Attempt ${i}/30 — ${COUNT} Ingress resource(s) still present, waiting 10s..."
+
+            # After 3 failed attempts (~30 s), the ALB controller has had time to
+            # start — if the Ingress is still stuck it almost certainly has a
+            # finalizer blocking deletion.  Strip it immediately so we don't
+            # burn the full 5-minute loop before the job gets cancelled.
+            if [ "${i}" -ge 3 ]; then
+              STUCK=$(kubectl get ingress -A --no-headers 2>/dev/null | awk '{print $1"/"$2}')
+              if [ -n "${STUCK}" ]; then
+                echo "Ingress stuck after ${i} attempts — removing finalizers forcefully."
+                while IFS='/' read -r NS NAME; do
+                  echo "Force-removing finalizers from Ingress ${NS}/${NAME}"
+                  kubectl patch ingress "${NAME}" -n "${NS}" \
+                    --type=json \
+                    -p='[{"op":"replace","path":"/metadata/finalizers","value":[]}]' \
+                    || true
+                  kubectl delete ingress "${NAME}" -n "${NS}" --force --grace-period=0 || true
+                done <<< "${STUCK}"
+                echo "Finalizers removed — waiting 10s for objects to disappear..."
+                sleep 10
+                break
+              fi
+            fi
+
             sleep 10
           done
 
-          # Forcefully remove finalizers if any Ingress is still stuck
-          STUCK=$(kubectl get ingress -A --no-headers 2>/dev/null | awk '{print $1"/"$2}')
-          if [ -n "${STUCK}" ]; then
-            echo "WARNING: Ingress still stuck after wait. Removing finalizers forcefully."
+          # Final safety-net: if anything is still lingering, force-remove it
+          REMAINING=$(kubectl get ingress -A --no-headers 2>/dev/null | awk '{print $1"/"$2}')
+          if [ -n "${REMAINING}" ]; then
+            echo "WARNING: Ingress still present after wait loop. Forcing removal."
             while IFS='/' read -r NS NAME; do
               echo "Force-removing finalizers from Ingress ${NS}/${NAME}"
               kubectl patch ingress "${NAME}" -n "${NS}" \
@@ -76,7 +99,7 @@ jobs:
                 -p='[{"op":"replace","path":"/metadata/finalizers","value":[]}]' \
                 || true
               kubectl delete ingress "${NAME}" -n "${NS}" --force --grace-period=0 || true
-            done <<< "${STUCK}"
+            done <<< "${REMAINING}"
             sleep 5
           fi
 
